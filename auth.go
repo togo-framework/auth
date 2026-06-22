@@ -106,11 +106,13 @@ type Guard struct {
 
 // Service is the auth runtime stored on the kernel (k.Get("auth")).
 type Service struct {
-	k        *togo.Kernel
-	secret   []byte
-	ttl      time.Duration
-	guards   map[string]*Guard
-	def      string
+	k             *togo.Kernel
+	secret        []byte
+	ttl           time.Duration
+	guards        map[string]*Guard
+	def           string
+	sessions      SessionStore // nil => stateless cookie sessions
+	sessionDriver string
 }
 
 // New builds the service, ensures the users table exists, and registers the
@@ -141,6 +143,9 @@ func New(k *togo.Kernel) (*Service, error) {
 		return nil, err
 	}
 	if err := s.ensureMFASchema(context.Background()); err != nil {
+		return nil, err
+	}
+	if err := s.initSessions(); err != nil {
 		return nil, err
 	}
 	s.RegisterGuard("api", &dbAuthenticator{s: s})

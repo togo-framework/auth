@@ -17,7 +17,7 @@ func (s *Service) IssueSession(w http.ResponseWriter, id Identity) (string, erro
 	if err != nil {
 		return "", err
 	}
-	s.setSessionCookie(w, token)
+	s.startSession(w, context.Background(), token)
 	s.fire(context.Background(), EventLogin, id)
 	return token, nil
 }

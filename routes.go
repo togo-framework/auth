@@ -92,7 +92,7 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		s.setSessionCookie(w, tok)
+		s.startSession(w, ctx, tok)
 		s.fire(ctx, EventRegistered, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusCreated, map[string]any{"token": tok})
 		return
@@ -112,14 +112,14 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, _ := s.IssueToken(*u.identity(s.def))
-	s.setSessionCookie(w, token)
+	s.startSession(w, ctx, token)
 	s.fire(ctx, EventRegistered, u)
 	writeJSON(w, http.StatusCreated, map[string]any{"token": token, "user": u})
 }
 
-// handleLogout clears the session cookie.
+// handleLogout clears the session cookie and revokes the server-side session.
 func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.clearSessionCookie(w)
+	s.endSession(w, r)
 	if id, ok := IdentityFrom(r.Context()); ok {
 		s.fire(r.Context(), EventLogout, id)
 	}
@@ -139,7 +139,7 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 			return
 		}
-		s.setSessionCookie(w, tok)
+		s.startSession(w, ctx, tok)
 		s.fire(ctx, EventLogin, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusOK, map[string]any{"token": tok})
 		return
@@ -151,7 +151,7 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, _ := s.IssueToken(*id)
-	s.setSessionCookie(w, token)
+	s.startSession(w, ctx, token)
 	s.fire(ctx, EventLogin, id)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": id})
 }
