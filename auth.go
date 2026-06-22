@@ -20,7 +20,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/togo-framework/togo"
-	"github.com/togo-framework/togo/orm"
+	"github.com/togo-framework/orm"
 )
 
 func firstEnv(keys ...string) string {
