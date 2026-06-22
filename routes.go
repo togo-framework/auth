@@ -47,6 +47,11 @@ func (s *Service) mountRoutes() {
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/verify", s.handle2FAVerify)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin", s.handlePINSet)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin/verify", s.handlePINVerify)
+
+	// Scoped API tokens (Sanctum/Cloudflare-style abilities).
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/tokens", s.handleCreateToken)
+	r.With(s.Middleware).Get("/api/auth/tokens", s.handleListTokens)
+	r.With(s.Middleware, s.csrfGuard).Delete("/api/auth/tokens/{id}", s.handleRevokeToken)
 }
 
 // minPasswordLen is the enforced minimum (override via AUTH_MIN_PASSWORD).

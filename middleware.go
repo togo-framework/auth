@@ -12,7 +12,7 @@ type ctxKey struct{}
 // Identity in context. 401 if the token is missing/invalid.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, err := s.Verify(s.resolveToken(r))
+		id, err := s.authenticate(r)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
