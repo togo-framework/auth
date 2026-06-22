@@ -39,14 +39,14 @@ func (s *Service) mountRoutes() {
 	r.With(s.Middleware).Get("/api/auth/me", s.handleMe)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/change-password", s.handleChangePassword)
 	r.With(s.Middleware).Post("/api/auth/logout", s.handleLogout)
-	// Endpoints the frontend auth suite calls; OTP/2FA/PIN/reset land with the
-	// mail/OTP provider plugins.
-	for _, p := range []string{"reset", "otp", "2fa", "pin"} {
-		p := p
-		r.Post("/api/auth/"+p, func(w http.ResponseWriter, _ *http.Request) {
-			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": p + " requires an OTP/mail provider plugin"})
-		})
-	}
+
+	// MFA: OTP (delivery decoupled via EventOTPRequested), TOTP 2FA, PIN lock screen.
+	r.With(s.csrfGuard).Post("/api/auth/otp", rl.limit(s.handleOTP))
+	r.With(s.csrfGuard).Post("/api/auth/otp/verify", rl.limit(s.handleOTPVerify))
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/enroll", s.handle2FAEnroll)
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/verify", s.handle2FAVerify)
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin", s.handlePINSet)
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin/verify", s.handlePINVerify)
 }
 
 // minPasswordLen is the enforced minimum (override via AUTH_MIN_PASSWORD).

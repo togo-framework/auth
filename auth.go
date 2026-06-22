@@ -140,6 +140,9 @@ func New(k *togo.Kernel) (*Service, error) {
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := s.ensureMFASchema(context.Background()); err != nil {
+		return nil, err
+	}
 	s.RegisterGuard("api", &dbAuthenticator{s: s})
 	return s, nil
 }

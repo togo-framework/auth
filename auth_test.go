@@ -76,3 +76,15 @@ func TestPasswordPolicy(t *testing.T) {
 		t.Fatal("password over 72 bytes must be rejected")
 	}
 }
+
+func TestTOTP(t *testing.T) {
+	secret := newTOTPSecret()
+	code := totpAt(secret, time.Now())
+	if !totpValid(secret, code) {
+		t.Fatal("freshly generated TOTP code must validate")
+	}
+	if totpValid(secret, "000000") && code != "000000" {
+		t.Fatal("wrong TOTP code must not validate")
+	}
+}
+
