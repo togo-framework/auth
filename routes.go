@@ -4,9 +4,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
+)
+
+var (
+	errPolicy  = fmt.Errorf("password must be at least %d characters", minPasswordLen())
+	errTooLong = errors.New("password must be at most 72 bytes")
 )
 
 // driver selects the auth backend: "base" (DB + JWT, default) or "supabase".
@@ -17,22 +25,49 @@ func (s *Service) driver() string {
 	return "base"
 }
 
-// mountRoutes registers /api/auth/* on the kernel router. Designed so Supabase/
-// GoTrue is first-class (AUTH_DRIVER=supabase) and other backends drop in as
-// driver plugins.
+// mountRoutes registers /api/auth/* on the kernel router with rate limiting +
+// CSRF. Supabase/GoTrue is first-class (AUTH_DRIVER=supabase); other backends
+// drop in as driver plugins.
 func (s *Service) mountRoutes() {
 	r := s.k.Router
-	r.Post("/api/auth/register", s.handleRegister)
-	r.Post("/api/auth/login", s.handleLogin)
+	// Brute-force protection: 10 attempts / 5 min per IP on credential endpoints.
+	rl := newRateLimiter(10, 5*time.Minute)
+
+	r.With(s.csrfGuard).Post("/api/auth/register", rl.limit(s.handleRegister))
+	r.With(s.csrfGuard).Post("/api/auth/login", rl.limit(s.handleLogin))
+	r.Get("/api/auth/csrf", s.issueCSRF)
 	r.With(s.Middleware).Get("/api/auth/me", s.handleMe)
-	r.With(s.Middleware).Post("/api/auth/change-password", s.handleChangePassword)
-	// Endpoints the frontend auth suite calls; full flows land incrementally.
-	for _, p := range []string{"reset", "otp", "2fa", "pin", "logout"} {
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/change-password", s.handleChangePassword)
+	r.With(s.Middleware).Post("/api/auth/logout", s.handleLogout)
+	// Endpoints the frontend auth suite calls; OTP/2FA/PIN/reset land with the
+	// mail/OTP provider plugins.
+	for _, p := range []string{"reset", "otp", "2fa", "pin"} {
 		p := p
 		r.Post("/api/auth/"+p, func(w http.ResponseWriter, _ *http.Request) {
-			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": p + " not implemented yet"})
+			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": p + " requires an OTP/mail provider plugin"})
 		})
 	}
+}
+
+// minPasswordLen is the enforced minimum (override via AUTH_MIN_PASSWORD).
+func minPasswordLen() int {
+	if v := os.Getenv("AUTH_MIN_PASSWORD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 8
+}
+
+// validatePassword enforces length policy (bcrypt caps input at 72 bytes).
+func validatePassword(p string) error {
+	if len(p) < minPasswordLen() {
+		return errPolicy
+	}
+	if len(p) > 72 {
+		return errTooLong
+	}
+	return nil
 }
 
 type credentials struct {
@@ -46,6 +81,10 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email and password required"})
 		return
 	}
+	if err := validatePassword(c.Password); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
 	ctx := r.Context()
 	if s.driver() == "supabase" {
 		tok, err := supabaseSignup(ctx, c.Email, c.Password)
@@ -53,12 +92,14 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
+		s.setSessionCookie(w, tok)
+		s.fire(ctx, EventRegistered, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusCreated, map[string]any{"token": tok})
 		return
 	}
 	hash, err := hashPassword(c.Password)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "hash failed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 		return
 	}
 	u := User{ID: genID(), Email: c.Email, PasswordHash: hash, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
@@ -66,11 +107,23 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"id": u.ID, "email": u.Email, "password_hash": u.PasswordHash,
 		"roles": "", "permissions": "", "created_at": u.CreatedAt,
 	}); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "could not create user (email taken?)"})
+		// Generic message — don't reveal whether the email already exists.
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "registration failed"})
 		return
 	}
 	token, _ := s.IssueToken(*u.identity(s.def))
+	s.setSessionCookie(w, token)
+	s.fire(ctx, EventRegistered, u)
 	writeJSON(w, http.StatusCreated, map[string]any{"token": token, "user": u})
+}
+
+// handleLogout clears the session cookie.
+func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSessionCookie(w)
+	if id, ok := IdentityFrom(r.Context()); ok {
+		s.fire(r.Context(), EventLogout, id)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -86,15 +139,20 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 			return
 		}
+		s.setSessionCookie(w, tok)
+		s.fire(ctx, EventLogin, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusOK, map[string]any{"token": tok})
 		return
 	}
 	id, err := s.Guard("").Auth.Attempt(ctx, c.Email, c.Password)
 	if err != nil {
+		s.fire(ctx, EventLoginFailed, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
 	}
 	token, _ := s.IssueToken(*id)
+	s.setSessionCookie(w, token)
+	s.fire(ctx, EventLogin, id)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": id})
 }
 
@@ -112,6 +170,10 @@ func (s *Service) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "old_password and new_password required"})
 		return
 	}
+	if err := validatePassword(body.New); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
 	id, _ := IdentityFrom(r.Context())
 	ctx := r.Context()
 	u, err := s.users().Find(ctx, id.ID)
@@ -124,6 +186,7 @@ func (s *Service) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "update failed"})
 		return
 	}
+	s.fire(ctx, EventPasswordChanged, id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

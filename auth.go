@@ -8,7 +8,11 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +23,36 @@ import (
 	"github.com/togo-framework/togo/orm"
 )
 
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// isProduction reports whether the app is running in production (fail-closed gate).
+func isProduction() bool {
+	e := strings.ToLower(firstEnv("APP_ENV", "ENV", "TOGO_ENV"))
+	return e == "production" || e == "prod"
+}
+
+func randomSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func tokenTTL() time.Duration {
+	if v := os.Getenv("AUTH_TTL_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Hour
+		}
+	}
+	return 24 * time.Hour
+}
+
 func init() {
 	togo.RegisterProviderFunc("auth", togo.PriorityLate+5, func(k *togo.Kernel) error {
 		svc, err := New(k)
@@ -26,6 +60,7 @@ func init() {
 			return err
 		}
 		k.Set("auth", svc)
+		k.Router.Use(svc.cors) // credential-aware CORS for the whole app
 		svc.mountRoutes()
 		return nil
 	})
@@ -79,20 +114,26 @@ type Service struct {
 }
 
 // New builds the service, ensures the users table exists, and registers the
-// default DB-backed guard.
+// default DB-backed guard. It fails closed in production when no strong secret
+// is configured.
 func New(k *togo.Kernel) (*Service, error) {
-	secret := os.Getenv("AUTH_SECRET")
+	secret := firstEnv("AUTH_SECRET", "JWT_SECRET")
 	if secret == "" {
-		secret = os.Getenv("JWT_SECRET")
-	}
-	if secret == "" {
-		secret = "dev-insecure-secret-change-me"
-		k.Log.Warn("AUTH_SECRET not set — using an insecure dev secret")
+		if isProduction() {
+			return nil, errors.New("AUTH_SECRET is required in production (>= 32 bytes)")
+		}
+		secret = randomSecret() // ephemeral dev secret; tokens won't survive a restart
+		k.Log.Warn("AUTH_SECRET not set — generated an ephemeral dev secret; set AUTH_SECRET for stable tokens")
+	} else if len(secret) < 32 {
+		if isProduction() {
+			return nil, errors.New("AUTH_SECRET must be at least 32 bytes in production")
+		}
+		k.Log.Warn("AUTH_SECRET is shorter than 32 bytes — use a longer secret in production")
 	}
 	s := &Service{
 		k:      k,
 		secret: []byte(secret),
-		ttl:    24 * time.Hour,
+		ttl:    tokenTTL(),
 		guards: map[string]*Guard{},
 		def:    "api",
 	}
@@ -148,22 +189,32 @@ func (s *Service) ensureSchema(ctx context.Context) error {
 
 // IssueToken signs a JWT for an identity.
 func (s *Service) IssueToken(id Identity) (string, error) {
+	now := time.Now()
 	claims := jwt.MapClaims{
 		"sub":   id.ID,
 		"email": id.Email,
 		"roles": strings.Join(id.Roles, ","),
 		"perms": strings.Join(id.Permissions, ","),
 		"guard": id.Guard,
-		"exp":   time.Now().Add(s.ttl).Unix(),
+		"iss":   "togo",
+		"iat":   now.Unix(),
+		"nbf":   now.Unix(),
+		"exp":   now.Add(s.ttl).Unix(),
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
 }
 
-// Verify parses a token into an Identity.
+// Verify parses a token into an Identity. Enforces HS256, a required expiry, and
+// the issuer — rejecting alg-confusion, unexpiring, and foreign tokens.
 func (s *Service) Verify(token string) (*Identity, error) {
+	if token == "" {
+		return nil, errors.New("missing token")
+	}
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(token, claims, func(*jwt.Token) (any, error) { return s.secret, nil },
-		jwt.WithValidMethods([]string{"HS256"}))
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer("togo"))
 	if err != nil {
 		return nil, err
 	}

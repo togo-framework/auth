@@ -1,0 +1,15 @@
+name: security
+on: [push, pull_request]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26.4' }
+      - name: build & test
+        run: go build ./... && go test ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest ./...

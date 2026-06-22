@@ -1,10 +1,10 @@
 module github.com/togo-framework/auth
 
-go 1.26
+go 1.26.4
 
 require (
-	github.com/golang-jwt/jwt/v5 v5.2.1
-	github.com/togo-framework/togo v0.12.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/togo-framework/togo v0.13.0
 	golang.org/x/crypto v0.27.0
 )
 

@@ -13,7 +13,7 @@ type ctxKey struct{}
 // Identity in context. 401 if the token is missing/invalid.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, err := s.Verify(bearer(r))
+		id, err := s.Verify(tokenFrom(r))
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
@@ -51,8 +51,19 @@ func IdentityFrom(ctx context.Context) (*Identity, bool) {
 	return id, ok
 }
 
-func bearer(r *http.Request) string {
-	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+// SessionCookie is the name of the HttpOnly cookie holding the session token.
+const SessionCookie = "togo_session"
+
+// tokenFrom extracts the token from the Authorization bearer header (APIs) or the
+// session cookie (SSR / browser).
+func tokenFrom(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	if c, err := r.Cookie(SessionCookie); err == nil {
+		return c.Value
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

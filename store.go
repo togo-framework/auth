@@ -4,10 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ErrInvalidCredentials is returned when email/password don't match.
 var ErrInvalidCredentials = errors.New("invalid credentials")
+
+// dummyHash equalizes login timing when an email doesn't exist, preventing user
+// enumeration via response-time differences.
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("timing-equalizer"), bcrypt.DefaultCost)
 
 func (s *Service) sqlDB() *sql.DB {
 	db, _ := s.k.SQL(context.Background())
@@ -32,7 +38,11 @@ func (d *dbAuthenticator) Attempt(ctx context.Context, email, password string) (
 	if err != nil {
 		return nil, err
 	}
-	if u == nil || !checkPassword(u.PasswordHash, password) {
+	if u == nil {
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password)) // constant-time
+		return nil, ErrInvalidCredentials
+	}
+	if !checkPassword(u.PasswordHash, password) {
 		return nil, ErrInvalidCredentials
 	}
 	return u.identity("api"), nil
