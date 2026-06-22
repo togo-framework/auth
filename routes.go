@@ -36,6 +36,7 @@ func (s *Service) mountRoutes() {
 	r.With(s.csrfGuard).Post("/api/auth/register", rl.limit(s.handleRegister))
 	r.With(s.csrfGuard).Post("/api/auth/login", rl.limit(s.handleLogin))
 	r.Get("/api/auth/csrf", s.issueCSRF)
+	r.Get("/api/auth/methods", s.handleMethods)
 	r.With(s.Middleware).Get("/api/auth/me", s.handleMe)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/change-password", s.handleChangePassword)
 	r.With(s.Middleware).Post("/api/auth/logout", s.handleLogout)
