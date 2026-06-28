@@ -35,6 +35,30 @@ togo install togo-framework/auth
 ```
 
 
+## Admin user management
+
+Every app that mounts auth gets a guarded user-admin + impersonation API out of
+the box, under `/api/auth/admin/*` (behind `RequireRole("admin")`; writes also
+carry the CSRF guard). It reuses the same `users` table, bcrypt hashing, and
+`IssueToken`/`IssueSession` the login flow uses.
+
+| Method | Path | Body | Returns |
+|--------|------|------|---------|
+| GET    | `/api/auth/admin/users` `?q=` | — | `[]user` |
+| GET    | `/api/auth/admin/users/{id}` | — | `user` |
+| POST   | `/api/auth/admin/users` | `{email, password?, roles?[], permissions?[]}` | `{user, note}` (201) |
+| PATCH  | `/api/auth/admin/users/{id}` | `{email?, roles?[], permissions?[]}` | `user` |
+| DELETE | `/api/auth/admin/users/{id}` | — | `{deleted, id}` (409 on last admin) |
+| POST   | `/api/auth/admin/users/{id}/impersonate` | — | `{token, identity}` |
+| POST   | `/api/auth/admin/users/{id}/reset-password` | `{password?}` | `{reset:true}` or `{link, emailed:false}` |
+| POST   | `/api/auth/admin/users/{id}/magic-link` | — | `{link, emailed:false}` |
+| GET    | `/api/auth/magic` `?token=` | — | 302 → signs the user in |
+
+Mail is decoupled: when no mailer is wired the signed (HMAC over `AUTH_SECRET`,
+~1h TTL) magic/reset link is returned in the response and an
+`auth.magic_link_issued` / `auth.password_reset` event is fired so a mail plugin
+can deliver it.
+
 ## Frontend
 
 UI lives in the separate [dashboard](https://github.com/togo-framework/dashboard)
