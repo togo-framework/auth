@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -19,8 +20,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/togo-framework/togo"
 	"github.com/togo-framework/orm"
+	"github.com/togo-framework/togo"
 )
 
 func firstEnv(keys ...string) string {
@@ -54,13 +55,35 @@ func tokenTTL() time.Duration {
 }
 
 func init() {
+	// chi requires every middleware to be installed before the first route is
+	// registered. Plugins that mount routes at PriorityService (aeo, board, chat,
+	// dashboard, feed, media, seo-head, site-search, widget, …) run long before
+	// this provider, so installing CORS here panics once any of them is loaded.
+	// Install the middleware in the PriorityCore band instead and resolve the
+	// service lazily — it is nil until the provider below runs, and a request
+	// cannot arrive before the kernel has finished booting.
+	togo.RegisterProviderFunc("auth-cors", togo.PriorityCore, func(k *togo.Kernel) error {
+		k.Router.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if v, ok := k.Get("auth"); ok {
+					if svc, ok := v.(*Service); ok && svc != nil {
+						svc.cors(next).ServeHTTP(w, r)
+						return
+					}
+				}
+				next.ServeHTTP(w, r)
+			})
+		})
+		return nil
+	})
+
 	togo.RegisterProviderFunc("auth", togo.PriorityLate+5, func(k *togo.Kernel) error {
 		svc, err := New(k)
 		if err != nil {
 			return err
 		}
 		k.Set("auth", svc)
-		k.Router.Use(svc.cors) // credential-aware CORS for the whole app
+		// CORS is installed by the auth-cors provider above (chi ordering).
 		svc.mountRoutes()
 		return nil
 	})
