@@ -53,6 +53,10 @@ func (s *Service) mountRoutes() {
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/tokens", s.handleCreateToken)
 	r.With(s.Middleware).Get("/api/auth/tokens", s.handleListTokens)
 	r.With(s.Middleware, s.csrfGuard).Delete("/api/auth/tokens/{id}", s.handleRevokeToken)
+
+	// Admin user management + impersonation (guarded by RequireRole("admin")) and
+	// the public magic-link consume endpoint.
+	s.mountAdminRoutes(r)
 }
 
 // minPasswordLen is the enforced minimum (override via AUTH_MIN_PASSWORD).

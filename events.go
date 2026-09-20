@@ -11,6 +11,15 @@ const (
 	EventLogout          = "auth.logout"
 	EventPasswordChanged = "auth.password_changed"
 	EventLoginFailed     = "auth.login_failed"
+
+	// Admin user-management events. Apps/plugins (audit, mail) subscribe to react —
+	// e.g. the mail plugin delivers the magic/reset link from EventMagicLinkIssued.
+	EventUserCreated      = "auth.user_created"
+	EventUserUpdated      = "auth.user_updated"
+	EventUserDeleted      = "auth.user_deleted"
+	EventUserImpersonated = "auth.user_impersonated"
+	EventMagicLinkIssued  = "auth.magic_link_issued"
+	EventPasswordReset    = "auth.password_reset"
 )
 
 // fire dispatches an auth event on the kernel hook bus (no-op if unavailable).
