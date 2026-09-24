@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +65,35 @@ func TestSetPassword(t *testing.T) {
 	}
 	if err := svc.SetPassword(ctx, "nobody", "brand-new-password-2"); !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("unknown user: %v", err)
+	}
+}
+
+func TestCSRFSparesNativeClientsNotBrowsers(t *testing.T) {
+	srv, svc := bootAuth(t)
+	ctx := context.Background()
+	if _, err := svc.CreateUser(ctx, "native@example.com", "native-password-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	post := func(headers map[string]string) int {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/auth/login", strings.NewReader(`{"email":"native@example.com","password":"native-password-1"}`))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	if code := post(nil); code != http.StatusOK {
+		t.Fatalf("a native client (no cookies, no Origin) should sign in, got %d", code)
+	}
+	if code := post(map[string]string{"Origin": "https://evil.example"}); code != http.StatusForbidden {
+		t.Fatalf("SECURITY: a cross-site browser POST must still need the token, got %d", code)
+	}
+	if code := post(map[string]string{"Cookie": "togo_session=x"}); code != http.StatusForbidden {
+		t.Fatalf("SECURITY: a cookie-carrying request must still need the token, got %d", code)
 	}
 }

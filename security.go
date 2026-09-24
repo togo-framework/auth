@@ -118,6 +118,15 @@ func (s *Service) csrfGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Native apps and scripts (no cookies, no Origin) cannot be driven by
+		// another site, so there is nothing to forge. Browsers always send
+		// Origin on cross-site POSTs, so a forged form or fetch is still checked.
+		// Before v0.9.4 mobile apps could not sign in at all: login demanded a
+		// CSRF cookie they had no reason to hold.
+		if r.Header.Get("Origin") == "" && len(r.Cookies()) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
 		c, err := r.Cookie(csrfCookie)
 		header := r.Header.Get("X-CSRF-Token")
 		if err != nil || header == "" || subtle.ConstantTimeCompare([]byte(c.Value), []byte(header)) != 1 {
