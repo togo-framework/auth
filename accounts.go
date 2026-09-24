@@ -75,3 +75,29 @@ func (s *Service) CreateUser(ctx context.Context, email, password string, roles 
 	s.fire(ctx, EventRegistered, u)
 	return u.identity(s.def), nil
 }
+
+// SetPassword replaces an account's password, for an admin resetting a user
+// who cannot receive a reset link. The password policy applies, and
+// EventPasswordChanged fires as it does for a self-service change.
+func (s *Service) SetPassword(ctx context.Context, userID, password string) error {
+	if err := validatePassword(password); err != nil {
+		return err
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	db, err := s.k.SQL(ctx)
+	if err != nil {
+		return err
+	}
+	res, err := db.ExecContext(ctx, `UPDATE users SET password_hash = `+s.ph(1)+` WHERE id = `+s.ph(2), hash, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrUserNotFound
+	}
+	s.fire(ctx, EventPasswordChanged, map[string]string{"user_id": userID, "by": "admin"})
+	return nil
+}

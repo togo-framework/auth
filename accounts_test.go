@@ -42,3 +42,27 @@ func TestAccountHelpers(t *testing.T) {
 		t.Fatal("an anonymous request must not authenticate")
 	}
 }
+
+func TestSetPassword(t *testing.T) {
+	_, svc := bootAuth(t)
+	ctx := context.Background()
+	id, err := svc.CreateUser(ctx, "reset@example.com", "original-password-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetPassword(ctx, id.ID, "short"); err == nil {
+		t.Fatal("the password policy must apply")
+	}
+	if err := svc.SetPassword(ctx, id.ID, "brand-new-password-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Guard("").Auth.Attempt(ctx, "reset@example.com", "original-password-1"); err == nil {
+		t.Fatal("the old password must stop working")
+	}
+	if _, err := svc.Guard("").Auth.Attempt(ctx, "reset@example.com", "brand-new-password-2"); err != nil {
+		t.Fatalf("the new password should work: %v", err)
+	}
+	if err := svc.SetPassword(ctx, "nobody", "brand-new-password-2"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("unknown user: %v", err)
+	}
+}
