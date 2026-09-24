@@ -35,7 +35,7 @@ func (d *dbSessionStore) Put(ctx context.Context, sid, token string, ttl time.Du
 	exp := time.Now().Add(ttl).UTC().Format(time.RFC3339)
 	p := d.s.ph
 	q := "INSERT INTO auth_sessions (sid, token, expires_at) VALUES (" + //#nosec G202 -- dialect placeholders only; values parameterized
-		p(1) + ", " + p(2) + ", " + p(3) + ") ON CONFLICT (sid) DO UPDATE SET token = " + p(2) + ", expires_at = " + p(3)
+		p(1) + ", " + p(2) + ", " + p(3) + ") ON CONFLICT (sid) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at"
 	_, err = db.ExecContext(ctx, q, sid, token, exp)
 	return err
 }

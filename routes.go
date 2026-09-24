@@ -46,6 +46,13 @@ func (s *Service) mountRoutes() {
 	r.With(s.csrfGuard).Post("/api/auth/otp/verify", rl.limit(s.handleOTPVerify))
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/enroll", s.handle2FAEnroll)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/verify", s.handle2FAVerify)
+	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/disable", s.handle2FADisable)
+	// Second step of a 2FA login: challenge (from /login) + code → session.
+	r.With(s.csrfGuard).Post("/api/auth/2fa/challenge", rl.limit(s.handle2FAChallenge))
+
+	// Password reset; delivery is decoupled via EventPasswordResetRequested.
+	r.With(s.csrfGuard).Post("/api/auth/password/forgot", rl.limit(s.handlePasswordForgot))
+	r.With(s.csrfGuard).Post("/api/auth/password/reset", rl.limit(s.handlePasswordReset))
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin", s.handlePINSet)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin/verify", s.handlePINVerify)
 
@@ -154,6 +161,18 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fire(ctx, EventLoginFailed, map[string]string{"email": c.Email})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	// A user with 2FA gets a challenge, not a session. Before v0.9.0 the
+	// session was issued here regardless, so enabled 2FA was never enforced.
+	if s.SecondFactorRequired(ctx, id.ID) {
+		challenge, err := s.IssueLoginChallenge(id.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "login failed"})
+			return
+		}
+		s.fire(ctx, EventLoginChallenged, map[string]string{"user_id": id.ID})
+		writeJSON(w, http.StatusOK, map[string]any{"mfa_required": true, "challenge": challenge})
 		return
 	}
 	token, _ := s.IssueToken(*id)

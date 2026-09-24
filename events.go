@@ -11,6 +11,14 @@ const (
 	EventLogout          = "auth.logout"
 	EventPasswordChanged = "auth.password_changed"
 	EventLoginFailed     = "auth.login_failed"
+
+	// EventPasswordResetRequested carries {user_id, email, token, expires_at}.
+	// A mail/SMS/notifications listener delivers the reset link; the token is
+	// never returned over HTTP.
+	EventPasswordResetRequested = "auth.password_reset_requested"
+	EventPasswordReset          = "auth.password_reset"
+	// EventLoginChallenged fires when a password login is held for 2FA.
+	EventLoginChallenged = "auth.login_challenged"
 )
 
 // fire dispatches an auth event on the kernel hook bus (no-op if unavailable).

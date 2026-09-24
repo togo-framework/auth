@@ -174,6 +174,9 @@ func New(k *togo.Kernel) (*Service, error) {
 	if err := s.ensurePATSchema(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := s.ensureResetSchema(context.Background()); err != nil {
+		return nil, err
+	}
 	s.RegisterGuard("api", &dbAuthenticator{s: s})
 	return s, nil
 }

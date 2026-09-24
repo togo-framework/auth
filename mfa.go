@@ -65,7 +65,7 @@ func (s *Service) handleOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	exp := time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
 	q := "INSERT INTO otp_codes (subject, purpose, code_hash, expires_at) VALUES (" + //#nosec G202 -- dialect placeholders only; values parameterized
-		s.ph(1) + ", " + s.ph(2) + ", " + s.ph(3) + ", " + s.ph(4) + ") ON CONFLICT (subject, purpose) DO UPDATE SET code_hash = " + s.ph(3) + ", expires_at = " + s.ph(4)
+		s.ph(1) + ", " + s.ph(2) + ", " + s.ph(3) + ", " + s.ph(4) + ") ON CONFLICT (subject, purpose) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at"
 	if _, err := db.ExecContext(ctx, q, body.Email, body.Purpose, hash, exp); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "otp store failed"})
 		return
@@ -114,15 +114,22 @@ func (s *Service) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handle2FAEnroll(w http.ResponseWriter, r *http.Request) {
 	id, _ := IdentityFrom(r.Context())
-	secret := newTOTPSecret()
 	ctx := r.Context()
+	// Re-enrolling used to overwrite an active secret with an inactive one,
+	// silently switching 2FA off for anyone holding a session. Turning it off
+	// now takes a valid code, via /api/auth/2fa/disable.
+	if s.totpEnabled(ctx, id.ID) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "2fa already enabled; disable it with a valid code first"})
+		return
+	}
+	secret := newTOTPSecret()
 	db, err := s.k.SQL(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unavailable"})
 		return
 	}
 	q := "INSERT INTO auth_totp (subject, secret, enabled) VALUES (" + s.ph(1) + ", " + s.ph(2) + ", '') " + //#nosec G202 -- dialect placeholders only; values parameterized
-		"ON CONFLICT (subject) DO UPDATE SET secret = " + s.ph(2) + ", enabled = ''"
+		"ON CONFLICT (subject) DO UPDATE SET secret = excluded.secret, enabled = ''"
 	if _, err := db.ExecContext(ctx, q, id.ID, secret); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "enroll failed"})
 		return
@@ -178,7 +185,7 @@ func (s *Service) handlePINSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := "INSERT INTO auth_pins (subject, pin_hash) VALUES (" + s.ph(1) + ", " + s.ph(2) + ") " + //#nosec G202 -- dialect placeholders only; values parameterized
-		"ON CONFLICT (subject) DO UPDATE SET pin_hash = " + s.ph(2)
+		"ON CONFLICT (subject) DO UPDATE SET pin_hash = excluded.pin_hash"
 	if _, err := db.ExecContext(ctx, q, id.ID, hash); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "pin set failed"})
 		return
@@ -245,4 +252,27 @@ func randUint32() uint32 {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
 	return binary.BigEndian.Uint32(b)
+}
+
+// handle2FADisable turns TOTP off, but only with a currently valid code, so a
+// stolen session alone cannot remove the second factor.
+func (s *Service) handle2FADisable(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	id, _ := IdentityFrom(r.Context())
+	ctx := r.Context()
+	if !s.verifyUserTOTP(ctx, id.ID, body.Code) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid code"})
+		return
+	}
+	db, err := s.k.SQL(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unavailable"})
+		return
+	}
+	//#nosec G202 -- dialect placeholders only; values parameterized
+	_, _ = db.ExecContext(ctx, "DELETE FROM auth_totp WHERE subject = "+s.ph(1), id.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa disabled"})
 }
