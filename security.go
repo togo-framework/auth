@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -87,20 +86,6 @@ func (rl *rateLimiter) limit(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
-}
-
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := indexByte(xff, ','); i >= 0 {
-			return trimSpace(xff[:i])
-		}
-		return trimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // ---- CSRF (double-submit cookie) ----------------------------------------
