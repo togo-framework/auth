@@ -42,3 +42,14 @@ func (s *Service) FindOrCreateByEmail(ctx context.Context, email string) (*Ident
 	s.fire(ctx, EventRegistered, nu)
 	return nu.identity(s.def), nil
 }
+
+// FindByEmail returns the identity for an existing account, or nil if there is
+// none. Unlike FindOrCreateByEmail it never creates an account, so it is the
+// one to use for flows a stranger can trigger (magic links, OTP login).
+func (s *Service) FindByEmail(ctx context.Context, email string) (*Identity, error) {
+	u, err := s.users().Where("email", "=", email).First(ctx)
+	if err != nil || u == nil {
+		return nil, err
+	}
+	return u.identity(s.def), nil
+}
