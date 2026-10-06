@@ -56,11 +56,10 @@ func (s *Service) handlePasswordForgot(w http.ResponseWriter, r *http.Request) {
 	defer writeJSON(w, http.StatusAccepted, map[string]string{"status": "if that account exists, a reset link has been sent"})
 
 	ctx := r.Context()
-	users, err := s.users().Where("email", "=", strings.TrimSpace(body.Email)).Limit(1).Get(ctx)
-	if err != nil || len(users) == 0 {
+	user, err := s.userByEmail(ctx, body.Email)
+	if err != nil || user == nil {
 		return
 	}
-	user := users[0]
 	db, err := s.k.SQL(ctx)
 	if err != nil {
 		return

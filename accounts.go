@@ -58,6 +58,9 @@ func (s *Service) SetRoles(ctx context.Context, userID string, roles []string) e
 // bootstrap steps that must not go through public registration. It fires
 // EventRegistered like registration does.
 func (s *Service) CreateUser(ctx context.Context, email, password string, roles []string) (*Identity, error) {
+	if email = normalizeEmail(email); !validEmail(email) {
+		return nil, errInvalidEmail
+	}
 	if err := validatePassword(password); err != nil {
 		return nil, err
 	}
@@ -65,7 +68,7 @@ func (s *Service) CreateUser(ctx context.Context, email, password string, roles 
 	if err != nil {
 		return nil, err
 	}
-	u := User{ID: genID(), Email: strings.TrimSpace(email), PasswordHash: hash, Roles: strings.Join(roles, ","), CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	u := User{ID: genID(), Email: email, PasswordHash: hash, Roles: strings.Join(roles, ","), CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	if _, err := s.users().Create(ctx, map[string]any{
 		"id": u.ID, "email": u.Email, "password_hash": u.PasswordHash,
 		"roles": u.Roles, "permissions": "", "created_at": u.CreatedAt,

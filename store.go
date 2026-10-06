@@ -34,7 +34,7 @@ func (u User) identity(guard string) *Identity {
 type dbAuthenticator struct{ s *Service }
 
 func (d *dbAuthenticator) Attempt(ctx context.Context, email, password string) (*Identity, error) {
-	u, err := d.s.users().Where("email", "=", email).First(ctx)
+	u, err := d.s.userByEmail(ctx, email)
 	if err != nil {
 		return nil, err
 	}

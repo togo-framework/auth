@@ -25,14 +25,14 @@ func (s *Service) IssueSession(w http.ResponseWriter, id Identity) (string, erro
 // FindOrCreateByEmail returns the identity for email, creating a passwordless
 // account if none exists (used by SSO/OAuth where there's no local password).
 func (s *Service) FindOrCreateByEmail(ctx context.Context, email string) (*Identity, error) {
-	u, err := s.users().Where("email", "=", email).First(ctx)
+	u, err := s.userByEmail(ctx, email)
 	if err != nil {
 		return nil, err
 	}
 	if u != nil {
 		return u.identity(s.def), nil
 	}
-	nu := User{ID: genID(), Email: email, PasswordHash: "!sso", CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	nu := User{ID: genID(), Email: normalizeEmail(email), PasswordHash: "!sso", CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	if _, err := s.users().Create(ctx, map[string]any{
 		"id": nu.ID, "email": nu.Email, "password_hash": nu.PasswordHash,
 		"roles": "", "permissions": "", "created_at": nu.CreatedAt,
@@ -47,7 +47,7 @@ func (s *Service) FindOrCreateByEmail(ctx context.Context, email string) (*Ident
 // none. Unlike FindOrCreateByEmail it never creates an account, so it is the
 // one to use for flows a stranger can trigger (magic links, OTP login).
 func (s *Service) FindByEmail(ctx context.Context, email string) (*Identity, error) {
-	u, err := s.users().Where("email", "=", email).First(ctx)
+	u, err := s.userByEmail(ctx, email)
 	if err != nil || u == nil {
 		return nil, err
 	}
