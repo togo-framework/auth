@@ -46,7 +46,7 @@ func (d *dbSessionStore) Get(ctx context.Context, sid string) (string, bool, err
 		return "", false, err
 	}
 	var token, exp string
-	//#nosec G202 -- dialect placeholder only; value parameterized
+	//#nosec G202,G701 -- dialect placeholder only; value parameterized
 	if db.QueryRowContext(ctx, "SELECT token, expires_at FROM auth_sessions WHERE sid = "+d.s.ph(1), sid).Scan(&token, &exp) != nil {
 		return "", false, nil
 	}
@@ -62,7 +62,7 @@ func (d *dbSessionStore) Delete(ctx context.Context, sid string) error {
 	if err != nil {
 		return err
 	}
-	//#nosec G202 -- dialect placeholder only; value parameterized
+	//#nosec G202,G701 -- dialect placeholder only; value parameterized
 	_, err = db.ExecContext(ctx, "DELETE FROM auth_sessions WHERE sid = "+d.s.ph(1), sid)
 	return err
 }
@@ -95,7 +95,7 @@ func (f *fileSessionStore) Put(_ context.Context, sid, token string, ttl time.Du
 func (f *fileSessionStore) Get(ctx context.Context, sid string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	b, err := os.ReadFile(f.path(sid))
+	b, err := os.ReadFile(f.path(sid)) //#nosec G304,G703 -- path() strips sid to its base name inside the session dir
 	if err != nil {
 		return "", false, nil
 	}
@@ -104,7 +104,7 @@ func (f *fileSessionStore) Get(ctx context.Context, sid string) (string, bool, e
 		return "", false, nil
 	}
 	if t, err := time.Parse(time.RFC3339, exp); err != nil || time.Now().After(t) {
-		_ = os.Remove(f.path(sid))
+		_ = os.Remove(f.path(sid)) //#nosec G703 -- path() strips sid to its base name
 		return "", false, nil
 	}
 	return token, true, nil
