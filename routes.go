@@ -87,6 +87,10 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email and password required"})
 		return
 	}
+	if c.Email = normalizeEmail(c.Email); !validEmail(c.Email) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": errInvalidEmail.Error()})
+		return
+	}
 	if err := validatePassword(c.Password); err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 		return
