@@ -44,6 +44,7 @@ func (s *Service) SetRoles(ctx context.Context, userID string, roles []string) e
 	if err != nil {
 		return err
 	}
+	//#nosec G202,G701 -- dialect placeholders only; values parameterized
 	res, err := db.ExecContext(ctx, `UPDATE users SET roles = `+s.ph(1)+` WHERE id = `+s.ph(2), strings.Join(clean, ","), userID)
 	if err != nil {
 		return err
@@ -94,6 +95,7 @@ func (s *Service) SetPassword(ctx context.Context, userID, password string) erro
 	if err != nil {
 		return err
 	}
+	//#nosec G202,G701 -- dialect placeholders only; values parameterized
 	res, err := db.ExecContext(ctx, `UPDATE users SET password_hash = `+s.ph(1)+` WHERE id = `+s.ph(2), hash, userID)
 	if err != nil {
 		return err
