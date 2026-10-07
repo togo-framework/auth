@@ -223,7 +223,7 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 	}
 	// The link was issued against the account as it was then: a promotion (or a
 	// promote-demote round trip) since voids it. The token is burned already.
-	if ok, err := s.linkContextHolds(ctx, hash, u.ID); err != nil {
+	if ok, err := s.linkContextHolds(ctx, hash, u.ID, issuer); err != nil {
 		s.adminInternal(w, "magic link", err)
 		return
 	} else if !ok {
@@ -269,7 +269,7 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 // linkContextHolds re-checks a magic link's issuance context under the account
 // row lock (see admin_recovery.go). The email is not part of a magic link's
 // meaning, so only the administrator status and privilege epoch are compared.
-func (s *Service) linkContextHolds(ctx context.Context, tokenHash, userID string) (bool, error) {
+func (s *Service) linkContextHolds(ctx context.Context, tokenHash, userID, issuer string) (bool, error) {
 	db, err := s.k.SQL(ctx)
 	if err != nil {
 		return false, err
@@ -284,6 +284,11 @@ func (s *Service) linkContextHolds(ctx context.Context, tokenHash, userID string
 	}
 	u, err := s.txUser(ctx, tx, userID)
 	if err != nil || u == nil {
+		return false, err
+	}
+	// The issuing administrator must still be one (F-R6-1), judged before the
+	// second-factor prompt or a session so a refused link looks like an unknown one.
+	if held, err := s.issuerHolds(ctx, tx, issuer); err != nil || !held {
 		return false, err
 	}
 	ok, err := s.recoveryContextHolds(ctx, tx, tokenHash, u, false)

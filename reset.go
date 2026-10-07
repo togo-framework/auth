@@ -193,6 +193,15 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		s.fire(ctx, EventCredentialRefused, map[string]string{"type": "reset", "issuer": issuer, "target_id": userID})
 		invalid()
 	}
+	// An administrator-issued token is also void once its issuer is deleted or no
+	// longer an administrator; this runs before any effect (F-R6-1).
+	if held, err := s.issuerHolds(ctx, tx, issuer); err != nil {
+		failed()
+		return
+	} else if !held {
+		refuse()
+		return
+	}
 	// A token is valid for the account as it was when issued. An email change
 	// (self-service tokens are delivered by email), a promotion or a demotion
 	// since then voids it, whoever issued it.

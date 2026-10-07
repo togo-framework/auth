@@ -153,6 +153,22 @@ func (s *Service) recoveryContextHolds(ctx context.Context, tx *sql.Tx, tokenHas
 // whoever set the email it was delivered to. Credential provenance follows the
 // authority that established the recovery path, not the endpoint that redeemed
 // it. "" means the holder's own path. markProvenance ignores the holder.
+// issuerHolds reports whether the administrator who issued a credential still
+// exists and still holds admin privilege now, read inside the redeeming
+// transaction. An admin-issued credential carries issuer-authority context as
+// well as target context: validity at issuance does not survive the issuer's
+// deletion or demotion (F-R6-1). An empty issuer (self-service) is not judged here.
+func (s *Service) issuerHolds(ctx context.Context, tx *sql.Tx, issuer string) (bool, error) {
+	if issuer == "" {
+		return true, nil
+	}
+	actor, err := s.txUser(ctx, tx, issuer)
+	if err != nil {
+		return false, err
+	}
+	return actor != nil && isAdminUser(actor), nil
+}
+
 func recoveryProvenanceBy(issuer string, prov provenance) []string {
 	if issuer != "" {
 		return []string{issuer}
