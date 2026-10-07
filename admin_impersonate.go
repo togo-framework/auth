@@ -118,8 +118,14 @@ func (s *Service) handleImpersonationStop(w http.ResponseWriter, r *http.Request
 		return
 	}
 	//#nosec G202 -- dialect placeholders only; values parameterized
-	if _, err := db.ExecContext(ctx, "INSERT INTO auth_revoked_tokens (jti, expires_at) VALUES ("+s.ph(1)+", "+s.ph(2)+")", id.TokenID, stamp(now.Add(maxImpersonationTTL))); err != nil {
+	// Idempotent: concurrent stops of one token all succeed, one records the end.
+	res, err := db.ExecContext(ctx, "INSERT INTO auth_revoked_tokens (jti, expires_at) VALUES ("+s.ph(1)+", "+s.ph(2)+") ON CONFLICT (jti) DO NOTHING", id.TokenID, stamp(now.Add(maxImpersonationTTL)))
+	if err != nil {
 		s.adminInternal(w, "stop impersonation", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
 	s.fire(ctx, EventImpersonationEnded, map[string]string{"actor_id": id.Impersonator, "target_id": id.ID, "at": stamp(now)})
