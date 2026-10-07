@@ -29,7 +29,7 @@ var pgDriverLinked bool // set by review_pg_test.go (build tag authpg)
 
 var authTables = []string{
 	"auth_magic_links", "auth_revoked_tokens", "auth_password_resets", "personal_access_tokens",
-	"auth_totp", "auth_pins", "otp_codes", "auth_sessions", "auth_account_state", "auth_reset_issuers", "auth_admin_guard", "users",
+	"auth_totp", "auth_pins", "otp_codes", "auth_sessions", "auth_account_state", "auth_reset_issuers", "auth_recovery_context", "auth_priv_epoch", "auth_admin_guard", "users",
 }
 
 func usingPG() bool { return os.Getenv("AUTH_REVIEW_PG_URL") != "" && pgDriverLinked }

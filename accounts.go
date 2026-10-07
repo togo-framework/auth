@@ -44,15 +44,25 @@ func (s *Service) SetRoles(ctx context.Context, userID string, roles []string) e
 	if err != nil {
 		return err
 	}
+	// The role write and the privilege epoch bump (which voids outstanding
+	// recovery tokens, see admin_recovery.go) commit together.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	//#nosec G202,G701 -- dialect placeholders only; values parameterized
-	res, err := db.ExecContext(ctx, `UPDATE users SET roles = `+s.ph(1)+` WHERE id = `+s.ph(2), strings.Join(clean, ","), userID)
+	res, err := tx.ExecContext(ctx, `UPDATE users SET roles = `+s.ph(1)+` WHERE id = `+s.ph(2), strings.Join(clean, ","), userID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrUserNotFound
 	}
-	return nil
+	if err := s.bumpPrivEpoch(ctx, tx, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateUser adds an account with a password and roles, for seeders and

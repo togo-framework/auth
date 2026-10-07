@@ -629,17 +629,18 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 			return &httpError{status: http.StatusNotFound, msg: "user not found"}
 		}
 		actorID := actorOf(r)
-		emailChanges := body.Email != nil && email != u.Email
 		promoted = body.Roles != nil && contains(roles, adminRole) && !isAdminUser(u)
 		demoted = body.Roles != nil && !contains(roles, adminRole) && isAdminUser(u)
 		if promoted {
-			// Provenance is read after the lock and before any write. An email this
-			// same request sets is the promoter's own, so it is exempt.
+			// Provenance is read after the lock and before any write, so it is the
+			// state before this request. Nothing this request sets is credited to
+			// the promoter: changing the email in the same request that grants
+			// admin authority does not turn a tainted identity into a clean one.
 			prov, err := s.readProvenance(ctx, tx, u.ID)
 			if err != nil {
 				return err
 			}
-			tainted = prov.taintedFields(u.ID, actorID, emailChanges)
+			tainted = prov.taintedFields(u.ID, actorID)
 			if len(tainted) > 0 {
 				if !body.Accept {
 					return provenanceConflict(prov, tainted)
@@ -682,6 +683,12 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 			}
 			add("email", email)
 			if err := s.markProvenance(ctx, tx, u.ID, fieldEmail, actorID); err != nil {
+				return err
+			}
+		}
+		if promoted || demoted {
+			// A change of administrator status voids outstanding recovery tokens.
+			if err := s.bumpPrivEpoch(ctx, tx, u.ID); err != nil {
 				return err
 			}
 		}
@@ -753,6 +760,8 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 			{"DELETE FROM auth_totp WHERE subject = ", u.ID},
 			{"DELETE FROM auth_pins WHERE subject = ", u.ID},
 			{"DELETE FROM auth_account_state WHERE user_id = ", u.ID},
+			{"DELETE FROM auth_recovery_context WHERE user_id = ", u.ID},
+			{"DELETE FROM auth_priv_epoch WHERE user_id = ", u.ID},
 			{"DELETE FROM otp_codes WHERE subject = ", u.Email},
 			{"DELETE FROM users WHERE id = ", u.ID},
 		} {

@@ -68,10 +68,23 @@ func (s *Service) handlePasswordForgot(w http.ResponseWriter, r *http.Request) {
 	}
 	token := randomToken() + randomToken()
 	expires := time.Now().Add(PasswordResetTTL).UTC()
+	// The token and the context it is issued against (email, who set it,
+	// administrator status) are stored together; redemption re-checks them.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
 	//#nosec G202 -- dialect placeholders only; values parameterized
-	if _, err := db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO auth_password_resets (token_hash, user_id, expires_at, used) VALUES ("+s.ph(1)+", "+s.ph(2)+", "+s.ph(3)+", '')",
 		hashResetToken(token), user.ID, expires.Format(time.RFC3339)); err != nil {
+		return
+	}
+	if err := s.recordRecoveryContext(ctx, tx, hashResetToken(token), user.ID); err != nil {
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		return
 	}
 	s.fire(ctx, EventPasswordResetRequested, map[string]string{
@@ -151,54 +164,73 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		failed()
 		return
 	}
+	// The account row lock comes before anything about the account is read, so a
+	// promotion or an email change either committed before the checks below or
+	// waits for this transaction.
+	if found, err := s.txLockUser(ctx, tx, userID); err != nil {
+		failed()
+		return
+	} else if !found {
+		invalid() // the account is gone; the burn is rolled back with nothing else to keep
+		return
+	}
 	target, err := s.txUser(ctx, tx, userID)
 	if err != nil {
 		failed()
 		return
 	}
 	if target == nil {
-		invalid() // the account is gone; the burn is rolled back with nothing else to keep
+		invalid()
 		return
 	}
-	if issuer == "" {
-		// Self-service token: the holder resets their own password.
-		//#nosec G202 -- dialect placeholders only; values parameterized
-		pw, err := tx.ExecContext(ctx, "UPDATE users SET password_hash = "+s.ph(1)+" WHERE id = "+s.ph(2), hash, userID)
+	// refuse commits the burn and answers like any invalid token: the token is
+	// dead either way and the refusal is not an oracle.
+	refuse := func() {
+		if err := tx.Commit(); err != nil {
+			failed()
+			return
+		}
+		s.fire(ctx, EventCredentialRefused, map[string]string{"type": "reset", "issuer": issuer, "target_id": userID})
+		invalid()
+	}
+	// A token is valid for the account as it was when issued. An email change
+	// (self-service tokens are delivered by email), a promotion or a demotion
+	// since then voids it, whoever issued it.
+	holds, err := s.recoveryContextHolds(ctx, tx, tokenHash, target, issuer == "")
+	if err != nil {
+		failed()
+		return
+	}
+	if !holds {
+		refuse()
+		return
+	}
+	prov, err := s.readProvenance(ctx, tx, userID)
+	if err != nil {
+		failed()
+		return
+	}
+	// The compare-and-set on the roles value just judged still guards the write.
+	// An administrator-issued token also stops working once the account is an
+	// administrator (unless AUTH_ADMIN_CROSS_CONTROL is on).
+	ok := issuer == "" || crossControlAllowed() || !isAdminUser(target)
+	if ok {
+		ok, err = s.txSetPasswordIfRoles(ctx, tx, userID, hash, target.Roles)
 		if err != nil {
 			failed()
 			return
 		}
-		if n, err := pw.RowsAffected(); err != nil || n != 1 {
-			invalid()
-			return
-		}
-	} else {
-		// An administrator-issued token stops working once the account is an
-		// administrator (unless AUTH_ADMIN_CROSS_CONTROL is on). The write is
-		// compare-and-set on the roles value just judged, so a promotion that
-		// commits between the read and the write is refused. A refusal commits
-		// the burn: the token is dead either way.
-		ok := crossControlAllowed() || !isAdminUser(target)
-		if ok {
-			ok, err = s.txSetPasswordIfRoles(ctx, tx, userID, hash, target.Roles)
-			if err != nil {
-				failed()
-				return
-			}
-		}
-		if !ok {
-			if err := tx.Commit(); err != nil {
-				failed()
-				return
-			}
-			s.fire(ctx, EventCredentialRefused, map[string]string{"type": "reset", "issuer": issuer, "target_id": userID})
-			invalid()
-			return
-		}
-		if err := s.markProvenance(ctx, tx, userID, fieldPassword, issuer); err != nil {
-			failed()
-			return
-		}
+	}
+	if !ok {
+		refuse()
+		return
+	}
+	// Credential provenance follows the authority that established the recovery
+	// path, not the endpoint that redeemed it: an admin-issued link traces to the
+	// admin, a self-service token to whoever set the email it was sent to.
+	if err := s.markProvenance(ctx, tx, userID, fieldPassword, recoveryProvenanceBy(issuer, prov)); err != nil {
+		failed()
+		return
 	}
 	// Burn any other outstanding tokens for the user.
 	//#nosec G202 -- dialect placeholders only; values parameterized

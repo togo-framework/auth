@@ -34,7 +34,7 @@ func (s *Service) ensureAdminSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, q := range []string{
+	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS auth_magic_links (
 			token_hash text PRIMARY KEY,
 			user_id text NOT NULL,
@@ -55,7 +55,9 @@ func (s *Service) ensureAdminSchema(ctx context.Context) error {
 		// Who set an account's email and password when it was not the holder (see
 		// admin_state.go). A side table: users is host-owned and never altered.
 		ensureAccountStateSQL(),
-	} {
+	}
+	stmts = append(stmts, ensureRecoveryContextSQL()...)
+	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return err
 		}
@@ -140,6 +142,15 @@ func (s *Service) issueLinkToken(ctx context.Context, table, createdBy, userID s
 	if _, err := tx.ExecContext(ctx, ins, args...); err != nil {
 		return "", time.Time{}, err
 	}
+	// The context the token is issued against; redemption re-checks it.
+	if err := s.recordRecoveryContext(ctx, tx, sha256hex(token), userID); err != nil {
+		return "", time.Time{}, err
+	}
+	// Context rows of tokens long gone are dead weight.
+	//#nosec G202 -- dialect placeholder only; value parameterized
+	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_recovery_context WHERE issued_at < "+s.ph(1), stamp(now.Add(-24*time.Hour))); err != nil {
+		return "", time.Time{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", time.Time{}, err
 	}
@@ -210,6 +221,15 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 		invalid()
 		return
 	}
+	// The link was issued against the account as it was then: a promotion (or a
+	// promote-demote round trip) since voids it. The token is burned already.
+	if ok, err := s.linkContextHolds(ctx, hash, u.ID); err != nil {
+		s.adminInternal(w, "magic link", err)
+		return
+	} else if !ok {
+		invalid()
+		return
+	}
 	if s.SecondFactorRequired(ctx, u.ID) {
 		writeErr(w, http.StatusForbidden, "second factor required; sign in with your password")
 		return
@@ -244,4 +264,31 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 		s.fire(ctx, EventMagicLinkRedeemed, map[string]string{"actor_id": issuer, "target_id": u.ID, "at": stamp(time.Now())})
 	}
 	http.Redirect(w, r, postLoginURL(), http.StatusFound)
+}
+
+// linkContextHolds re-checks a magic link's issuance context under the account
+// row lock (see admin_recovery.go). The email is not part of a magic link's
+// meaning, so only the administrator status and privilege epoch are compared.
+func (s *Service) linkContextHolds(ctx context.Context, tokenHash, userID string) (bool, error) {
+	db, err := s.k.SQL(ctx)
+	if err != nil {
+		return false, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if found, err := s.txLockUser(ctx, tx, userID); err != nil || !found {
+		return false, err
+	}
+	u, err := s.txUser(ctx, tx, userID)
+	if err != nil || u == nil {
+		return false, err
+	}
+	ok, err := s.recoveryContextHolds(ctx, tx, tokenHash, u, false)
+	if err != nil {
+		return false, err
+	}
+	return ok, tx.Commit()
 }

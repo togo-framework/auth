@@ -115,12 +115,12 @@ func (s *Service) deleteProvenance(ctx context.Context, tx *sql.Tx, userID strin
 }
 
 // taintedFields lists the fields of the account userID that somebody other than
-// the holder and the promoter set. skipEmail excludes the email when the same
-// promotion request is about to set it as the promoter.
-func (p provenance) taintedFields(userID, promoter string, skipEmail bool) []string {
+// the holder and the promoter set. It is judged on the provenance stored before
+// the promotion request: a write the request itself makes earns no credit.
+func (p provenance) taintedFields(userID, promoter string) []string {
 	foreign := func(by string) bool { return by != "" && by != userID && by != promoter }
 	var out []string
-	if !skipEmail && foreign(p.EmailBy) {
+	if foreign(p.EmailBy) {
 		out = append(out, fieldEmail)
 	}
 	if foreign(p.PasswordBy) {
