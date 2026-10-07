@@ -68,6 +68,16 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
   account returns `409 identity_set_by_other_admin` unless that request carries
   `accept_identity_set_by_other`; the acceptance is recorded and audited in
   `auth.admin_promoted`. The UI must not retry it silently.
+- **Self-service is not a trust source.** Its trust derives from the provenance and
+  current validity of the recovery identity or credential used to perform it. A
+  password set by redeeming a token sent to an email an administrator set is recorded
+  as that administrator's. Promotion judges provenance as it was before the request;
+  changing the email in the same request does not clear it.
+- **Recovery tokens do not survive a transition.** A reset token or magic link is
+  checked at redemption, inside the transaction and under the account row lock, against
+  the account as it was when issued: email and who set it (self-service tokens),
+  administrator status and a promote/demote counter (all tokens). A refused token is
+  burned and answers the same `401` as an unknown one.
 - **Act-limited sessions** (impersonation, magic link) end when the target becomes an
   administrator, unless `AUTH_ADMIN_CROSS_CONTROL=true`.
 - **Exported Go API is for trusted callers**: `SetPassword` and friends skip the

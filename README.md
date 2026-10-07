@@ -157,6 +157,21 @@ between, nothing is written: a redemption commits the burn of the token, answers
 the same generic `401` as any invalid link, and emits `auth.credential_refused`
 (`type`, `issuer`, `target_id`); set-password answers `409`.
 
+Promotion is judged on the provenance stored before the request. Changing the
+`email` in the same request as the promotion does not clear another administrator's
+email provenance (still `409`); only a write the promoter made in an earlier request
+is exempt. A password set by redeeming a self-service reset token inherits the
+provenance of the email the token was sent to (an administrator-issued link: the
+issuer), so it counts as set by that administrator.
+
+Reset tokens and magic links are bound to the account state they were issued
+against (`auth_recovery_context`; `auth_priv_epoch` counts promotions and
+demotions; both created automatically, `users` is never altered). Redemption
+refuses a token, burning it and answering the generic `401`, if the email changed
+(self-service tokens), or the account was promoted or demoted since (all tokens).
+Tokens that predate the upgrade have no context and are refused. `SetRoles`
+bumps the counter too.
+
 New events: `auth.admin_promoted`, `auth.admin_demoted`, `auth.credential_refused`.
 
 ### Trusted-caller API

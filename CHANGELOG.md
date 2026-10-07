@@ -18,6 +18,16 @@
   an account whose email or password was set by another administrator returns
   `409 identity_set_by_other_admin` unless the request carries
   `accept_identity_set_by_other` (F12).
+- Round 5 correction (F-R5-1, F-R5-1c). Promotion judges the provenance stored
+  before the request: changing the email in the promoting request no longer
+  erases another administrator's email provenance. A credential set through a
+  recovery channel inherits that channel's provenance, so a self-service reset
+  through an inbox an administrator set records the password as theirs. Reset
+  tokens (self-service and admin-issued) and magic links record the account state
+  they were issued against (`auth_recovery_context`, `auth_priv_epoch`) and are
+  refused, burned, with the generic `401`, if the email (self-service tokens), the
+  administrator status or the privilege epoch changed since. Tokens issued before
+  an upgrade have no context and are refused (they live 30 minutes).
 - Impersonation and magic-link sessions end when the target becomes an
   administrator (F13).
 - Deleting an administrator emits `auth.admin_cross_control` (flag on) and removes
