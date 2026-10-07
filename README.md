@@ -176,6 +176,10 @@ refuses a token, burning it and answering the generic `401`, if the email change
 Tokens that predate the upgrade have no context and are refused. `SetRoles`
 bumps the counter too.
 
+An administrator-issued reset link or magic link also stops working if its issuer
+is deleted or no longer an administrator when it is redeemed: it is refused and
+burned with the generic `401`.
+
 New events: `auth.admin_promoted`, `auth.admin_demoted`, `auth.credential_refused`.
 
 ### Trusted-caller API

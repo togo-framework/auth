@@ -76,6 +76,10 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
   password set by redeeming a token sent to an email an administrator set is recorded
   as that administrator's. Promotion judges provenance as it was before the request;
   changing the email in the same request does not clear it.
+- **Admin-issued credentials need a live issuer.** A reset link or magic link is
+  refused, burned, with the generic `401`, if the issuing administrator was deleted
+  or demoted since issuance (checked at redemption, inside the transaction, before any
+  password change or session). Restoring the issuer does not revive the link.
 - **Recovery tokens do not survive a transition.** A reset token or magic link is
   checked at redemption, inside the transaction and under the account row lock, against
   the account as it was when issued: email and who set it (self-service tokens),

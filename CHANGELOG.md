@@ -18,6 +18,11 @@
   an account whose email or password was set by another administrator returns
   `409 identity_set_by_other_admin` unless the request carries
   `accept_identity_set_by_other` (F12).
+- Round 6 correction (F-R6-1). Admin-issued reset links and magic links
+  revalidate their issuer inside the redeem transaction: the issuing account must
+  still exist and still be an administrator, otherwise the credential is refused,
+  burned, with the same generic `401` as an unknown one. A demoted or deleted
+  admin can no longer redeem a link it issued.
 - Provenance accumulates (owner ruling, Round 5): each field records every
   administrator other than the holder who ever wrote it; a later write, a holder
   write or an accepted promotion never erases an earlier writer, and a promoter's
