@@ -76,9 +76,7 @@ func (s *Service) adminImpersonate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "you cannot impersonate yourself")
 		return
 	}
-	if isAdminUser(target) && !impersonateAdminsAllowed() {
-		s.deny(r, actor)
-		writeErr(w, http.StatusForbidden, "administrators cannot be impersonated")
+	if s.refuseAdminTarget(w, r, target) {
 		return
 	}
 

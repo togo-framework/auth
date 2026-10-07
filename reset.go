@@ -119,13 +119,45 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
 		return
 	}
-	if err := s.users().Where("id", "=", userID).Update(ctx, map[string]any{"password_hash": hash}); err != nil {
+	// Redeeming is one conditional UPDATE: of any number of concurrent requests
+	// with the same token exactly one sees a row affected and may set the
+	// password. Burning the token and setting the password commit together.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
 		return
 	}
-	// Burn this token and any other outstanding ones for the user.
+	defer func() { _ = tx.Rollback() }()
 	//#nosec G202 -- dialect placeholders only; values parameterized
-	_, _ = db.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE user_id = "+s.ph(1), userID)
+	res, err := tx.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE token_hash = "+s.ph(1)+" AND used = ''", hashResetToken(strings.TrimSpace(body.Token)))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		invalid()
+		return
+	}
+	//#nosec G202 -- dialect placeholders only; values parameterized
+	pw, err := tx.ExecContext(ctx, "UPDATE users SET password_hash = "+s.ph(1)+" WHERE id = "+s.ph(2), hash, userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		return
+	}
+	if n, err := pw.RowsAffected(); err != nil || n != 1 {
+		invalid() // the account is gone; the rollback un-burns nothing useful
+		return
+	}
+	// Burn any other outstanding tokens for the user.
+	//#nosec G202 -- dialect placeholders only; values parameterized
+	if _, err := tx.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE user_id = "+s.ph(1), userID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		return
+	}
 	s.fire(ctx, EventPasswordReset, map[string]string{"user_id": userID})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
 }

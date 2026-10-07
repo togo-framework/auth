@@ -33,6 +33,8 @@ const (
 	// EventMagicLinkIssued: actor_id, user_id, expires_at. The link itself goes
 	// only to the administrator who asked for it, in the HTTP response.
 	EventMagicLinkIssued = "auth.magic_link_issued"
+	// EventMagicLinkRedeemed: actor_id (the issuing admin), target_id, at.
+	EventMagicLinkRedeemed = "auth.magic_link_redeemed"
 	// EventAdminResetLinkIssued: actor_id, user_id, expires_at (no link).
 	EventAdminResetLinkIssued = "auth.admin_reset_link_issued"
 )

@@ -264,9 +264,30 @@ func (s *Service) signToken(id Identity, ttl time.Duration) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
 }
 
+// VerifyContext parses and validates a token, including every check that needs
+// the database: an impersonation token is rejected once it is revoked, its
+// administrator has lost the role, or either account is gone. It is the one
+// authoritative verification path; Verify delegates to it.
+func (s *Service) VerifyContext(ctx context.Context, token string) (*Identity, error) {
+	id, err := s.verify(token)
+	if err != nil {
+		return nil, err
+	}
+	if id.Impersonator != "" {
+		if err := s.checkImpersonation(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	return id, nil
+}
+
 // Verify parses a token into an Identity. Enforces HS256, a required expiry, and
 // the issuer — rejecting alg-confusion, unexpiring, and foreign tokens.
 func (s *Service) Verify(token string) (*Identity, error) {
+	return s.VerifyContext(context.Background(), token)
+}
+
+func (s *Service) verify(token string) (*Identity, error) {
 	if token == "" {
 		return nil, errors.New("missing token")
 	}

@@ -29,18 +29,9 @@ func (s *Service) authenticate(r *http.Request) (*Identity, error) {
 			return s.patIdentity(r.Context(), raw)
 		}
 	}
-	id, err := s.Verify(s.resolveToken(r))
-	if err != nil {
-		return nil, err
-	}
-	if id.Impersonator != "" {
-		// An impersonation token is only as good as the administrator behind it:
-		// it stops working when it is ended, or the actor or target is gone.
-		if err := s.checkImpersonation(r.Context(), id); err != nil {
-			return nil, err
-		}
-	}
-	return id, nil
+	// An impersonation token is only as good as the administrator behind it, so
+	// the database-backed verification is the one request auth uses.
+	return s.VerifyContext(r.Context(), s.resolveToken(r))
 }
 
 func (s *Service) ensurePATSchema(ctx context.Context) error {

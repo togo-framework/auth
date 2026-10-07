@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -151,10 +153,16 @@ func (s *Service) noImpersonation(next http.Handler) http.Handler {
 // ---- queries ---------------------------------------------------------------
 
 func (s *Service) userByID(ctx context.Context, id string) (*User, error) {
-	if id == "" {
+	if !plausibleID(id) {
 		return nil, nil
 	}
 	return s.users().Find(ctx, id)
+}
+
+// plausibleID rejects ids no account can have (empty, oversized, NUL or
+// invalid UTF-8, which PostgreSQL refuses outright) before they reach SQL.
+func plausibleID(id string) bool {
+	return id != "" && len(id) <= 128 && utf8.ValidString(id) && !strings.ContainsRune(id, 0)
 }
 
 // escapeLike makes user input literal inside a LIKE pattern (ESCAPE '\').
@@ -167,9 +175,12 @@ func (s *Service) adminListUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit := clampInt(r.URL.Query().Get("limit"), defaultListLimit, 1, maxListLimit)
 	offset := clampInt(r.URL.Query().Get("offset"), 0, 0, 1<<31-1)
-	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	// NUL and invalid UTF-8 make PostgreSQL error out; neither can be part of an
+	// email, so drop them rather than fail the search.
+	q := strings.ToValidUTF8(strings.ReplaceAll(r.URL.Query().Get("q"), "\x00", ""), "")
+	q = strings.ToLower(strings.TrimSpace(q))
 	if len(q) > 254 {
-		q = q[:254]
+		q = strings.ToValidUTF8(q[:254], "")
 	}
 
 	db, err := s.k.SQL(ctx)
@@ -314,6 +325,104 @@ func (s *Service) adminGetUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toAdminUser(u))
 }
 
+// httpError is a failure with a client-safe status and message.
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
+func conflict(msg string) error { return &httpError{http.StatusConflict, msg} }
+
+// failAdmin answers err: a client-safe httpError as is, anything else as a
+// logged, generic 500.
+func (s *Service) failAdmin(w http.ResponseWriter, op string, err error) {
+	var he *httpError
+	if errors.As(err, &he) {
+		writeErr(w, he.status, he.msg)
+		return
+	}
+	s.adminInternal(w, op, err)
+}
+
+// adminTx runs fn in a transaction that first takes a row lock on a single
+// sentinel row, so admin mutations serialise across processes and instances
+// (an in-process mutex cannot do that). Whatever fn reads after the lock is
+// the committed state left by the previous holder, which is what makes the
+// last-admin and email-uniqueness checks race-free.
+func (s *Service) adminTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	db, err := s.k.SQL(ctx)
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "UPDATE auth_admin_guard SET n = n + 1 WHERE id = 1"); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// txUser reads one account inside tx (nil when absent).
+func (s *Service) txUser(ctx context.Context, tx *sql.Tx, id string) (*User, error) {
+	if !plausibleID(id) {
+		return nil, nil
+	}
+	var u User
+	//#nosec G202 -- dialect placeholder only; value parameterized
+	err := tx.QueryRowContext(ctx, "SELECT id, email, roles, permissions, created_at FROM users WHERE id = "+s.ph(1), id).
+		Scan(&u.ID, &u.Email, &u.Roles, &u.Permissions, &u.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// emailTaken reports whether another account (not exceptID) already uses email
+// in any letter case, so legacy mixed-case rows count.
+func (s *Service) emailTaken(ctx context.Context, tx *sql.Tx, email, exceptID string) (bool, error) {
+	var id string
+	//#nosec G202 -- dialect placeholders only; values parameterized
+	err := tx.QueryRowContext(ctx, "SELECT id FROM users WHERE LOWER(email) = "+s.ph(1)+" AND id <> "+s.ph(2)+" LIMIT 1", normalizeEmail(email), exceptID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// otherAdmins counts the administrators other than exceptID, inside tx.
+func (s *Service) otherAdmins(ctx context.Context, tx *sql.Tx, exceptID string) (int, error) {
+	//#nosec G202 -- dialect placeholder only; value parameterized
+	rows, err := tx.QueryContext(ctx, `SELECT roles FROM users WHERE roles LIKE '%admin%' AND id <> `+s.ph(1), exceptID)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var roles string
+		if err := rows.Scan(&roles); err != nil {
+			return 0, err
+		}
+		if contains(splitCSV(roles), adminRole) {
+			n++
+		}
+	}
+	return n, rows.Err()
+}
+
+var errLastAdmin = conflict("cannot remove the last administrator")
+
 func (s *Service) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email       string   `json:"email"`
@@ -360,27 +469,22 @@ func (s *Service) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	s.adminMu.Lock()
-	defer s.adminMu.Unlock()
-	if existing, err := s.userByEmail(ctx, email); err != nil {
-		s.adminInternal(w, "check email", err)
-		return
-	} else if existing != nil {
-		writeErr(w, http.StatusConflict, "a user with that email already exists")
-		return
-	}
 	u := User{ID: genID(), Email: email, PasswordHash: hash, Roles: strings.Join(roles, ","),
 		Permissions: strings.Join(perms, ","), CreatedAt: time.Now().UTC().Format(time.RFC3339)}
-	if _, err := s.users().Create(ctx, map[string]any{
-		"id": u.ID, "email": u.Email, "password_hash": u.PasswordHash,
-		"roles": u.Roles, "permissions": u.Permissions, "created_at": u.CreatedAt,
-	}); err != nil {
-		// Lost a race with another writer for the same address.
-		if existing, qerr := s.userByEmail(ctx, email); qerr == nil && existing != nil {
-			writeErr(w, http.StatusConflict, "a user with that email already exists")
-			return
+	err := s.adminTx(ctx, func(tx *sql.Tx) error {
+		if taken, err := s.emailTaken(ctx, tx, email, ""); err != nil {
+			return err
+		} else if taken {
+			return conflict("a user with that email already exists")
 		}
-		s.adminInternal(w, "create user", err)
+		//#nosec G202 -- dialect placeholders only; values parameterized
+		_, err := tx.ExecContext(ctx, "INSERT INTO users (id, email, password_hash, roles, permissions, created_at) VALUES ("+
+			s.ph(1)+", "+s.ph(2)+", "+s.ph(3)+", "+s.ph(4)+", "+s.ph(5)+", "+s.ph(6)+")",
+			u.ID, u.Email, u.PasswordHash, u.Roles, u.Permissions, u.CreatedAt)
+		return err
+	})
+	if err != nil {
+		s.failAdmin(w, "create user", err)
 		return
 	}
 	s.fire(ctx, EventUserCreated, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "email": u.Email})
@@ -400,159 +504,143 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "nothing to update")
 		return
 	}
-	ctx := r.Context()
-	s.adminMu.Lock()
-	defer s.adminMu.Unlock()
-
-	u, err := s.userByID(ctx, chi.URLParam(r, "id"))
-	if err != nil {
-		s.adminInternal(w, "load user", err)
-		return
-	}
-	if u == nil {
-		writeErr(w, http.StatusNotFound, "user not found")
-		return
-	}
-
-	sets, args, fields := []string{}, []any{}, []string{}
-	add := func(col string, v any) {
-		args = append(args, v)
-		sets = append(sets, col+" = "+s.ph(len(args)))
-		fields = append(fields, col)
-	}
+	// Validate input before touching the database.
+	var email string
 	if body.Email != nil {
-		email := normalizeEmail(*body.Email)
-		if !validEmail(email) {
+		if email = normalizeEmail(*body.Email); !validEmail(email) {
 			writeErr(w, http.StatusUnprocessableEntity, errInvalidEmail.Error())
 			return
 		}
-		if email != u.Email {
-			other, err := s.userByEmail(ctx, email)
-			if err != nil {
-				s.adminInternal(w, "check email", err)
-				return
-			}
-			if other != nil && other.ID != u.ID {
-				writeErr(w, http.StatusConflict, "a user with that email already exists")
-				return
-			}
-			add("email", email)
-		}
 	}
+	var roles, perms []string
+	var ok bool
 	if body.Roles != nil {
-		roles, ok := cleanList(*body.Roles)
-		if !ok {
+		if roles, ok = cleanList(*body.Roles); !ok {
 			writeErr(w, http.StatusUnprocessableEntity, "invalid roles")
 			return
 		}
-		if isAdminUser(u) && !contains(roles, adminRole) {
-			if !s.otherAdminExists(w, ctx) {
-				return
-			}
-		}
-		add("roles", strings.Join(roles, ","))
 	}
 	if body.Permissions != nil {
-		perms, ok := cleanList(*body.Permissions)
-		if !ok {
+		if perms, ok = cleanList(*body.Permissions); !ok {
 			writeErr(w, http.StatusUnprocessableEntity, "invalid permissions")
 			return
 		}
-		add("permissions", strings.Join(perms, ","))
 	}
 
-	if len(sets) > 0 {
-		db, err := s.k.SQL(ctx)
+	ctx := r.Context()
+	id := chi.URLParam(r, "id")
+	var updated *User
+	fields := []string{}
+	err := s.adminTx(ctx, func(tx *sql.Tx) error {
+		u, err := s.txUser(ctx, tx, id)
 		if err != nil {
-			s.adminInternal(w, "update user", err)
-			return
+			return err
 		}
-		args = append(args, u.ID)
-		q := "UPDATE users SET " + strings.Join(sets, ", ") + " WHERE id = " + s.ph(len(args)) //#nosec G202 -- column names are constants; values parameterized
-		if _, err := db.ExecContext(ctx, q, args...); err != nil {
-			if body.Email != nil {
-				if other, qerr := s.userByEmail(ctx, normalizeEmail(*body.Email)); qerr == nil && other != nil && other.ID != u.ID {
-					writeErr(w, http.StatusConflict, "a user with that email already exists")
-					return
+		if u == nil {
+			return &httpError{http.StatusNotFound, "user not found"}
+		}
+		sets, args := []string{}, []any{}
+		add := func(col string, v any) {
+			args = append(args, v)
+			sets = append(sets, col+" = "+s.ph(len(args)))
+			fields = append(fields, col)
+		}
+		if body.Email != nil && email != u.Email {
+			if taken, err := s.emailTaken(ctx, tx, email, u.ID); err != nil {
+				return err
+			} else if taken {
+				return conflict("a user with that email already exists")
+			}
+			add("email", email)
+		}
+		if body.Roles != nil {
+			if isAdminUser(u) && !contains(roles, adminRole) {
+				if n, err := s.otherAdmins(ctx, tx, u.ID); err != nil {
+					return err
+				} else if n == 0 {
+					return errLastAdmin
 				}
 			}
-			s.adminInternal(w, "update user", err)
-			return
+			add("roles", strings.Join(roles, ","))
 		}
-		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "fields": strings.Join(fields, ",")})
-	}
-	updated, err := s.userByID(ctx, u.ID)
-	if err != nil || updated == nil {
-		s.adminInternal(w, "reload user", err)
+		if body.Permissions != nil {
+			add("permissions", strings.Join(perms, ","))
+		}
+		if len(sets) > 0 {
+			args = append(args, u.ID)
+			//#nosec G202 -- column names are constants; values parameterized
+			if _, err := tx.ExecContext(ctx, "UPDATE users SET "+strings.Join(sets, ", ")+" WHERE id = "+s.ph(len(args)), args...); err != nil {
+				return err
+			}
+		}
+		updated, err = s.txUser(ctx, tx, u.ID)
+		return err
+	})
+	if err != nil {
+		s.failAdmin(w, "update user", err)
 		return
+	}
+	if len(fields) > 0 {
+		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "user_id": updated.ID, "fields": strings.Join(fields, ",")})
 	}
 	writeJSON(w, http.StatusOK, toAdminUser(updated))
 }
 
-// otherAdminExists reports whether removing one admin leaves another. On false
-// it has already answered the request (409, or 500 on a database error).
-func (s *Service) otherAdminExists(w http.ResponseWriter, ctx context.Context) bool {
-	n, err := s.countAdmins(ctx)
-	if err != nil {
-		s.adminInternal(w, "count admins", err)
-		return false
-	}
-	if n <= 1 {
-		writeErr(w, http.StatusConflict, "cannot remove the last administrator")
-		return false
-	}
-	return true
-}
-
 func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	s.adminMu.Lock()
-	defer s.adminMu.Unlock()
-
-	u, err := s.userByID(ctx, chi.URLParam(r, "id"))
-	if err != nil {
-		s.adminInternal(w, "load user", err)
-		return
-	}
-	if u == nil {
-		writeErr(w, http.StatusNotFound, "user not found")
-		return
-	}
-	if isAdminUser(u) && !s.otherAdminExists(w, ctx) {
-		return
-	}
-	db, err := s.k.SQL(ctx)
-	if err != nil {
-		s.adminInternal(w, "delete user", err)
-		return
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		s.adminInternal(w, "delete user", err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	// The user's credentials and tokens go with the account.
-	for _, q := range []struct{ sql, arg string }{
-		{"DELETE FROM personal_access_tokens WHERE user_id = ", u.ID},
-		{"DELETE FROM auth_password_resets WHERE user_id = ", u.ID},
-		{"DELETE FROM auth_magic_links WHERE user_id = ", u.ID},
-		{"DELETE FROM auth_totp WHERE subject = ", u.ID},
-		{"DELETE FROM auth_pins WHERE subject = ", u.ID},
-		{"DELETE FROM otp_codes WHERE subject = ", u.Email},
-		{"DELETE FROM users WHERE id = ", u.ID},
-	} {
-		if _, err := tx.ExecContext(ctx, q.sql+s.ph(1), q.arg); err != nil { //#nosec G202 -- constant statements; dialect placeholder; value parameterized
-			s.adminInternal(w, "delete user", err)
-			return
+	var gone *User
+	err := s.adminTx(ctx, func(tx *sql.Tx) error {
+		u, err := s.txUser(ctx, tx, chi.URLParam(r, "id"))
+		if err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		s.adminInternal(w, "delete user", err)
+		if u == nil {
+			return &httpError{http.StatusNotFound, "user not found"}
+		}
+		if isAdminUser(u) {
+			if n, err := s.otherAdmins(ctx, tx, u.ID); err != nil {
+				return err
+			} else if n == 0 {
+				return errLastAdmin
+			}
+		}
+		// The user's credentials and tokens go with the account.
+		for _, q := range []struct{ sql, arg string }{
+			{"DELETE FROM personal_access_tokens WHERE user_id = ", u.ID},
+			{"DELETE FROM auth_password_resets WHERE user_id = ", u.ID},
+			{"DELETE FROM auth_magic_links WHERE user_id = ", u.ID},
+			{"DELETE FROM auth_totp WHERE subject = ", u.ID},
+			{"DELETE FROM auth_pins WHERE subject = ", u.ID},
+			{"DELETE FROM otp_codes WHERE subject = ", u.Email},
+			{"DELETE FROM users WHERE id = ", u.ID},
+		} {
+			if _, err := tx.ExecContext(ctx, q.sql+s.ph(1), q.arg); err != nil { //#nosec G202 -- constant statements; dialect placeholder; value parameterized
+				return err
+			}
+		}
+		gone = u
+		return nil
+	})
+	if err != nil {
+		s.failAdmin(w, "delete user", err)
 		return
 	}
-	s.fire(ctx, EventUserDeleted, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "email": u.Email})
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": u.ID})
+	s.fire(ctx, EventUserDeleted, map[string]string{"actor_id": actorOf(r), "user_id": gone.ID, "email": gone.Email})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": gone.ID})
+}
+
+// refuseAdminTarget answers 403 and returns true when target is an
+// administrator other than the caller and AUTH_IMPERSONATE_ADMINS is not set.
+// Impersonating, setting the password of, or minting a sign-in link for another
+// administrator are all ways of becoming them, so one rule covers all three.
+func (s *Service) refuseAdminTarget(w http.ResponseWriter, r *http.Request, target *User) bool {
+	actor, _ := IdentityFrom(r.Context())
+	if actor == nil || target.ID == actor.ID || !isAdminUser(target) || impersonateAdminsAllowed() {
+		return false
+	}
+	s.deny(r, actor)
+	writeErr(w, http.StatusForbidden, "administrators cannot be acted on this way")
+	return true
 }
 
 func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
@@ -570,6 +658,9 @@ func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if u == nil {
 		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if s.refuseAdminTarget(w, r, u) {
 		return
 	}
 	if body.Password != "" {
@@ -605,6 +696,9 @@ func (s *Service) adminMagicLink(w http.ResponseWriter, r *http.Request) {
 	}
 	if u == nil {
 		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if s.refuseAdminTarget(w, r, u) {
 		return
 	}
 	token, exp, err := s.createMagicToken(ctx, u.ID, actorOf(r))

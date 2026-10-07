@@ -46,6 +46,9 @@ func (s *Service) ensureAdminSchema(ctx context.Context) error {
 			jti text PRIMARY KEY,
 			expires_at text NOT NULL
 		)`,
+		// One sentinel row, locked by every admin mutation (see adminTx).
+		`CREATE TABLE IF NOT EXISTS auth_admin_guard (id integer PRIMARY KEY, n integer NOT NULL DEFAULT 0)`,
+		`INSERT INTO auth_admin_guard (id, n) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return err
@@ -159,9 +162,9 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := sha256hex(token)
-	var userID, expiresAt, used string
+	var userID, expiresAt, used, issuer string
 	//#nosec G202 -- dialect placeholder only; value parameterized
-	switch err := db.QueryRowContext(ctx, "SELECT user_id, expires_at, used FROM auth_magic_links WHERE token_hash = "+s.ph(1), hash).Scan(&userID, &expiresAt, &used); err {
+	switch err := db.QueryRowContext(ctx, "SELECT user_id, expires_at, used, created_by FROM auth_magic_links WHERE token_hash = "+s.ph(1), hash).Scan(&userID, &expiresAt, &used, &issuer); err {
 	case nil:
 	case sql.ErrNoRows:
 		invalid()
@@ -199,9 +202,28 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "second factor required; sign in with your password")
 		return
 	}
-	if _, err := s.IssueSession(w, *u.identity(s.def)); err != nil {
+	id := *u.identity(s.def)
+	// The session names the administrator who issued the link (act claim,
+	// /me `impersonator`, login event) and lasts only as long as an
+	// impersonation would, so a link is never an anonymous way in.
+	id.Impersonator = issuer
+	ttl := s.ttl
+	if issuer != "" {
+		if err := s.checkImpersonation(ctx, &id); err != nil {
+			invalid() // the issuing admin is no longer an administrator
+			return
+		}
+		ttl = impersonationTTL()
+	}
+	session, err := s.signToken(id, ttl)
+	if err != nil {
 		s.adminInternal(w, "magic link session", err)
 		return
+	}
+	s.startSession(w, ctx, session)
+	s.fire(ctx, EventLogin, id)
+	if issuer != "" {
+		s.fire(ctx, EventMagicLinkRedeemed, map[string]string{"actor_id": issuer, "target_id": u.ID, "at": stamp(time.Now())})
 	}
 	http.Redirect(w, r, postLoginURL(), http.StatusFound)
 }
