@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -33,7 +34,7 @@ type mxOp struct {
 
 type mxModel struct {
 	admin   bool
-	emailBy string // "" or "A" or "B"
+	emailBy string // writer SET, accumulating: "", "A", "B" or "AB"
 	pwBy    string
 	link    string // issuer of the outstanding admin-issued reset token, "" when none
 	pw      string // password the account should currently accept
@@ -42,7 +43,7 @@ type mxModel struct {
 }
 
 func (m *mxModel) tainted(promoter string) bool {
-	return (m.emailBy != "" && m.emailBy != promoter) || (m.pwBy != "" && m.pwBy != promoter)
+	return strings.Trim(m.emailBy, promoter) != "" || strings.Trim(m.pwBy, promoter) != ""
 }
 
 func mxOps() []mxOp {
@@ -57,7 +58,7 @@ func mxOps() []mxOp {
 				if m.admin {
 					return 403
 				}
-				m.emailBy = who
+				m.emailBy = addMx(m.emailBy, who)
 				return 200
 			},
 		}
@@ -73,7 +74,7 @@ func mxOps() []mxOp {
 				if m.admin {
 					return 403
 				}
-				m.pwBy = who
+				m.pwBy = addMx(m.pwBy, who)
 				m.pw = "mx-pass-" + strconv.Itoa(m.n) + "-xx"
 				return 200
 			},
@@ -141,7 +142,7 @@ func mxOps() []mxOp {
 				if m.admin {
 					return 401 // refused
 				}
-				m.pwBy = issuer
+				m.pwBy = addMx(m.pwBy, issuer)
 				m.pw = "mx-redeem-" + strconv.Itoa(m.n) + "-xx"
 				return 200
 			},
@@ -217,7 +218,12 @@ func TestLifecycleSequenceMatrix(t *testing.T) {
 			if field == "password" {
 				want = m.pwBy
 			}
-			wantID := map[string]string{"": "", "A": w.adminID, "B": w.admin2ID}[want]
+			var ids []string
+			for _, c := range want {
+				ids = append(ids, map[rune]string{'A': w.adminID, 'B': w.admin2ID}[c])
+			}
+			sort.Strings(ids)
+			wantID := strings.Join(ids, ",")
 			if got != wantID {
 				t.Fatalf("sequence %s: %s provenance %q, oracle %q", strings.Join(names, ","), field, got, wantID)
 			}
@@ -263,4 +269,14 @@ func TestLifecycleSequenceMatrix(t *testing.T) {
 		}
 		runSeq(q)
 	}
+}
+
+// addMx adds a writer to the oracle's accumulating writer set (sorted letters).
+func addMx(set, who string) string {
+	if who == "" || strings.Contains(set, who) {
+		return set
+	}
+	b := []byte(set + who)
+	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
+	return string(b)
 }

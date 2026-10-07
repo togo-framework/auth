@@ -228,9 +228,11 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	// Credential provenance follows the authority that established the recovery
 	// path, not the endpoint that redeemed it: an admin-issued link traces to the
 	// admin, a self-service token to whoever set the email it was sent to.
-	if err := s.markProvenance(ctx, tx, userID, fieldPassword, recoveryProvenanceBy(issuer, prov)); err != nil {
-		failed()
-		return
+	for _, by := range recoveryProvenanceBy(issuer, prov) {
+		if err := s.markProvenance(ctx, tx, userID, fieldPassword, by); err != nil {
+			failed()
+			return
+		}
 	}
 	// Burn any other outstanding tokens for the user.
 	//#nosec G202 -- dialect placeholders only; values parameterized

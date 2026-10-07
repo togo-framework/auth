@@ -153,9 +153,9 @@ func (s *Service) recoveryContextHolds(ctx context.Context, tx *sql.Tx, tokenHas
 // whoever set the email it was delivered to. Credential provenance follows the
 // authority that established the recovery path, not the endpoint that redeemed
 // it. "" means the holder's own path. markProvenance ignores the holder.
-func recoveryProvenanceBy(issuer string, prov provenance) string {
+func recoveryProvenanceBy(issuer string, prov provenance) []string {
 	if issuer != "" {
-		return issuer
+		return []string{issuer}
 	}
-	return prov.EmailBy
+	return writers(prov.EmailBy)
 }

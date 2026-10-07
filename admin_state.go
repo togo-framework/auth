@@ -17,7 +17,8 @@ import (
 // whoever set the password knows it. When an administrator sets either of them
 // on somebody else's account, a different administrator who later promotes that
 // account would hand it to the first one. auth_account_state records, per field,
-// who last set the email and the password when that was not the account holder:
+// who set the email and the password when that was not the account holder (every
+// such administrator, accumulated; see below):
 //
 //	email_set_by    admin changed the email (PATCH) or created the account
 //	password_set_by admin set the password (set-password, create) or redeemed an
@@ -25,8 +26,12 @@ import (
 //
 // The record is STICKY: the holder changing their own password does not clear
 // it (the administrator who set it can sign in as the holder and change it
-// again), and nothing but an explicit accept on the promotion releases it. A
-// later write by somebody else replaces the writer. Self actions never write,
+// again), and nothing but an explicit accept on the promotion, for that one
+// request, releases it. It is security HISTORY, not last-writer state: each field
+// holds the set of every non-holder administrator who ever wrote it, a later
+// writer is added and never replaces an earlier one, and a promoter's own earlier
+// writes are exempt only when the promoter is the sole non-holder writer.
+// Self actions never write,
 // and the exported SetRoles, SetPassword and CreateUser are trusted-caller APIs
 // that write nothing. An absent row means "nothing set by someone else".
 //
@@ -62,7 +67,12 @@ type provenance struct {
 
 // markProvenance records that by set field on userID's account. It does nothing
 // when by is empty or is the account holder. It must run inside the same
-// transaction as the write it describes.
+// transaction as the write it describes, and callers hold the account row lock
+// (the read-merge-write below is not safe against a concurrent writer without it).
+//
+// Writers ACCUMULATE: the stored value is the sorted, comma-separated set of
+// every administrator other than the holder who has ever set the field. A later
+// writer never erases an earlier one, and the holder's own writes touch nothing.
 func (s *Service) markProvenance(ctx context.Context, tx *sql.Tx, userID, field, by string) error {
 	if by == "" || by == userID {
 		return nil
@@ -78,9 +88,41 @@ func (s *Service) markProvenance(ctx context.Context, tx *sql.Tx, userID, field,
 	default:
 		return errors.New("auth: unknown provenance field")
 	}
+	prior, err := s.readProvenance(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	cur := prior.EmailBy
+	if field == fieldPassword {
+		cur = prior.PasswordBy
+	}
 	//#nosec G202 -- constant statements; dialect placeholders only; values parameterized
-	_, err := tx.ExecContext(ctx, q, userID, by, stamp(time.Now()))
+	_, err = tx.ExecContext(ctx, q, userID, addWriter(cur, by), stamp(time.Now()))
 	return err
+}
+
+// addWriter returns the sorted set cur plus by (cur is comma-separated ids).
+func addWriter(cur, by string) string {
+	set := writers(cur)
+	for _, w := range set {
+		if w == by {
+			return cur
+		}
+	}
+	set = append(set, by)
+	sort.Strings(set)
+	return strings.Join(set, ",")
+}
+
+// writers splits a stored writer set.
+func writers(v string) []string {
+	var out []string
+	for _, w := range strings.Split(v, ",") {
+		if w = strings.TrimSpace(w); w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // readProvenance loads userID's row inside tx (the zero value when absent).
@@ -115,10 +157,19 @@ func (s *Service) deleteProvenance(ctx context.Context, tx *sql.Tx, userID strin
 }
 
 // taintedFields lists the fields of the account userID that somebody other than
-// the holder and the promoter set. It is judged on the provenance stored before
-// the promotion request: a write the request itself makes earns no credit.
+// the holder and the promoter ever set. It is judged on the provenance stored
+// before the promotion request: a write the request itself makes earns no
+// credit. A field is exempt for the promoter only when the promoter is its sole
+// non-holder writer: any other writer in the set taints it.
 func (p provenance) taintedFields(userID, promoter string) []string {
-	foreign := func(by string) bool { return by != "" && by != userID && by != promoter }
+	foreign := func(by string) bool {
+		for _, w := range writers(by) {
+			if w != userID && w != promoter {
+				return true
+			}
+		}
+		return false
+	}
 	var out []string
 	if foreign(p.EmailBy) {
 		out = append(out, fieldEmail)
