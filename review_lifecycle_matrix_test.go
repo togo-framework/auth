@@ -3,8 +3,8 @@ package auth
 import (
 	"context"
 	"os"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
