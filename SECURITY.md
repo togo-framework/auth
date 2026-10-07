@@ -64,10 +64,13 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
   non-administrator; a promotion that lands in between is refused (generic `401` for a
   link, burning it; `409` for set-password) and emits `auth.credential_refused`.
 - **Provenance.** Email and password written by an administrator other than the holder
-  are recorded per field (`auth_account_state`) and stay recorded. Promoting such an
+  are recorded per field (`auth_account_state`), accumulate (a later administrator's
+  write never erases an earlier one's) and stay recorded. Promoting such an
   account returns `409 identity_set_by_other_admin` unless that request carries
   `accept_identity_set_by_other`; the acceptance is recorded and audited in
-  `auth.admin_promoted`. The UI must not retry it silently.
+  `auth.admin_promoted`, applies to that request only and does not clear the record.
+  The promoter's own earlier writes are exempt only when they are the sole writer. The
+  UI must not retry it silently.
 - **Self-service is not a trust source.** Its trust derives from the provenance and
   current validity of the recovery identity or credential used to perform it. A
   password set by redeeming a token sent to an email an administrator set is recorded

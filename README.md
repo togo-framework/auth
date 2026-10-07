@@ -131,8 +131,9 @@ An administrator who sets an account's email or password, or who creates the
 account, is recorded as the writer of that field in the side table
 `auth_account_state` (created automatically; `users` is never altered). The
 password written by redeeming an administrator-issued reset link is attributed to
-the issuer. Provenance is sticky: the holder changing their own password does
-**not** clear it.
+the issuer. Provenance is sticky and cumulative: the holder changing their own
+password does **not** clear it, and a later administrator's write does not erase
+an earlier administrator's: each field keeps every administrator who ever wrote it.
 
 Promoting an account to administrator (`PATCH /users/{id}` with `roles`
 containing `admin`) answers **`409 Conflict`** if any field was written by someone
@@ -147,8 +148,11 @@ The condition is deliberate and must be surfaced, never retried silently: a UI
 should show who set which field and ask the promoter to confirm. Sending the same
 request with `"accept_identity_set_by_other": true` promotes, and the acceptance
 applies to that one request only. It is recorded (`accepted_by`, `accepted_at`)
-and audited in `auth.admin_promoted` (`tainted`, `accepted`). A promoter's own
-earlier writes are exempt.
+and audited in `auth.admin_promoted` (`tainted`, `accepted`); it does not clear
+the provenance for later promotions. A promoter's own earlier writes are exempt
+only when the promoter is the sole non-holder writer of that field: if another
+administrator ever wrote it too, promotion answers `409` (`set_by` lists the
+writers, comma-separated).
 
 Redeeming an administrator-issued reset link and the admin set-password mode run
 in one transaction that writes the password only while the account's roles are
@@ -159,8 +163,8 @@ the same generic `401` as any invalid link, and emits `auth.credential_refused`
 
 Promotion is judged on the provenance stored before the request. Changing the
 `email` in the same request as the promotion does not clear another administrator's
-email provenance (still `409`); only a write the promoter made in an earlier request
-is exempt. A password set by redeeming a self-service reset token inherits the
+email provenance (still `409`); only a write the promoter made in an earlier request,
+and only as the field's sole writer, is exempt. A password set by redeeming a self-service reset token inherits the
 provenance of the email the token was sent to (an administrator-issued link: the
 issuer), so it counts as set by that administrator.
 

@@ -18,6 +18,10 @@
   an account whose email or password was set by another administrator returns
   `409 identity_set_by_other_admin` unless the request carries
   `accept_identity_set_by_other` (F12).
+- Provenance accumulates (owner ruling, Round 5): each field records every
+  administrator other than the holder who ever wrote it; a later write, a holder
+  write or an accepted promotion never erases an earlier writer, and a promoter's
+  own earlier writes are exempt only as the sole writer.
 - Round 5 correction (F-R5-1, F-R5-1c). Promotion judges the provenance stored
   before the request: changing the email in the promoting request no longer
   erases another administrator's email provenance. A credential set through a
