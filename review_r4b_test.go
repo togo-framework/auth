@@ -81,14 +81,31 @@ func TestReviewR4DefaultDeniesEveryPeerOp(t *testing.T) {
 		}
 	}
 	tokB := tokFor(t, w.svc, "peer@example.com")
+	// Either order is legal: if the self-demotion commits first, the account is
+	// an ordinary user when the email change is judged, and the change is
+	// allowed; if the email change comes first it is judged against an
+	// administrator and refused. What must never happen is the third outcome:
+	// the email changed while the account is still an administrator, or the
+	// answer disagreeing with the state.
 	var wg sync.WaitGroup
+	var codeB, codeA int
 	wg.Add(2)
-	go func() { defer wg.Done(); api(t, w, "PATCH", p, tokB, "{\"roles\":[]}") }()
-	go func() { defer wg.Done(); api(t, w, "PATCH", p, w.adminTok, "{\"email\":\"q@example.com\"}") }()
+	go func() { defer wg.Done(); codeB = api(t, w, "PATCH", p, tokB, "{\"roles\":[]}") }()
+	go func() { defer wg.Done(); codeA = api(t, w, "PATCH", p, w.adminTok, "{\"email\":\"q@example.com\"}") }()
 	wg.Wait()
 	u, _ := w.svc.userByID(ctx, b2.ID)
-	if u.Email != "peer@example.com" {
-		t.Errorf("SECURITY racing self-demote let another admin change the email: %s", u.Email)
+	changed := u.Email == "q@example.com"
+	if codeB != 200 {
+		t.Errorf("self-demotion => %d", codeB)
+	}
+	if changed != (codeA == 200) {
+		t.Errorf("answer %d disagrees with state (email %s)", codeA, u.Email)
+	}
+	if changed && isAdminUser(u) {
+		t.Errorf("SECURITY racing self-demote let another admin change the email of a still-administrator: %s", u.Email)
+	}
+	if !changed && codeA != 403 {
+		t.Errorf("refused email change => %d, want 403", codeA)
 	}
 }
 
