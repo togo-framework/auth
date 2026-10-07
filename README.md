@@ -86,6 +86,90 @@ Prefer `VerifyContext` with the request context.
 `auth.password_reset_requested` carries the raw reset token so a mailer can deliver it; it is
 for in-process hook subscribers only and must never be logged or forwarded to an external bus.
 
+## Sessions and the database (strict revalidation)
+
+A token proves who the caller is. The database decides what that caller may do
+now. With the built-in driver (`AUTH_DRIVER=base`) every authenticated request
+loads the account by id (one primary-key read), and:
+
+- if the account is gone, the request is `401`;
+- the identity's email, roles and permissions are replaced by the stored values.
+
+This happens in `VerifyContext` and in the personal-access-token path of
+`Authenticate`/`Middleware`, so everything that consumes the identity is
+database-authoritative with no change on your side: `RequireRole`,
+`RequirePermission`, `IdentityFrom`, `Authenticate`, and any route that reads
+claims from the context. A demoted administrator gets `403` on the very next
+request, a deleted account `401`, and a promoted user's existing session carries
+the admin role as soon as the database says so. An app that guards routes with
+`svc.RequireRole("admin")`, `svc.Middleware` or `svc.Authenticate` is covered.
+An app that parses the JWT itself (for example with its own `jwt.Parse`) is not:
+use `VerifyContext`.
+
+Details:
+
+- Revoked impersonation and magic-link tokens (by `jti`) stay refused.
+  An impersonation or magic-link session also needs its issuing administrator to
+  still be an administrator, and is refused once its target is an administrator
+  (unless `AUTH_ADMIN_CROSS_CONTROL=true`).
+- Personal access tokens revalidate only that the owner exists. They keep their
+  own abilities and are never administrators.
+- There is no disabled or suspended state in this plugin, so "the account
+  exists" is the whole test. `revalidate` in `auth.go` is the single place a
+  future disabled or security-version check goes.
+- Applies to the base driver only. With `AUTH_DRIVER=supabase` (or any external
+  driver) the provider owns identity, the users table is not authoritative, and
+  tokens are verified as before.
+- No new configuration; no token claim or session format changes. Tokens issued
+  before an upgrade keep working: their roles are simply read from the database.
+- `Verify(token)` now performs the database check (it calls `VerifyContext`
+  with a background context). Prefer `VerifyContext` with the request context.
+
+## Provenance and the promotion gate
+
+An administrator who sets an account's email or password, or who creates the
+account, is recorded as the writer of that field in the side table
+`auth_account_state` (created automatically; `users` is never altered). The
+password written by redeeming an administrator-issued reset link is attributed to
+the issuer. Provenance is sticky: the holder changing their own password does
+**not** clear it.
+
+Promoting an account to administrator (`PATCH /users/{id}` with `roles`
+containing `admin`) answers **`409 Conflict`** if any field was written by someone
+other than the holder and the promoting administrator:
+
+```json
+{"error":"identity_set_by_other_admin","message":"...","tainted_fields":["email"],
+ "set_by":{"email":"<admin id>"},"set_at":{"email":"..."},"accept_field":"accept_identity_set_by_other"}
+```
+
+The condition is deliberate and must be surfaced, never retried silently: a UI
+should show who set which field and ask the promoter to confirm. Sending the same
+request with `"accept_identity_set_by_other": true` promotes, and the acceptance
+applies to that one request only. It is recorded (`accepted_by`, `accepted_at`)
+and audited in `auth.admin_promoted` (`tainted`, `accepted`). A promoter's own
+earlier writes are exempt.
+
+Redeeming an administrator-issued reset link and the admin set-password mode run
+in one transaction that writes the password only while the account's roles are
+still the value that was judged non-administrator. If the account was promoted in
+between, nothing is written: a redemption commits the burn of the token, answers
+the same generic `401` as any invalid link, and emits `auth.credential_refused`
+(`type`, `issuer`, `target_id`); set-password answers `409`.
+
+New events: `auth.admin_promoted`, `auth.admin_demoted`, `auth.credential_refused`.
+
+### Trusted-caller API
+
+The exported Go methods (`SetPassword`, `SetRoles`, `CreateUser`, ...) are for
+trusted code in your own process. They apply the password policy but do not
+apply the admin-target rules above, write no provenance, and do not take the
+compare-and-set. Do not expose them to request input without your own
+authorization.
+
+Startup logs a warning if the retired variable `AUTH_IMPERSONATE_ADMINS` is set:
+it has no effect; the flag is `AUTH_ADMIN_CROSS_CONTROL`.
+
 ## Frontend
 
 UI lives in the separate [dashboard](https://github.com/togo-framework/dashboard)

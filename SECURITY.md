@@ -50,6 +50,29 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
   enforced for every caller. `auth.password_reset_requested` carries the raw token for
   the mailer: in-process hook subscribers only; never log or forward it.
 
+## Session revalidation and admin lifecycle (auth#6)
+- **Strict revalidation (base driver).** Every authenticated request loads the account
+  by id; a missing account is `401`, and the identity's email, roles and permissions
+  are replaced by the database values, so `RequireRole`, `RequirePermission` and every
+  other claims consumer are database-authoritative. A demoted administrator is refused
+  on the next request; a deleted account's token stops working. Revoked `jti`s stay
+  refused. There is no disabled state; the single hook for one is `revalidate` in
+  `auth.go`. External drivers (`AUTH_DRIVER=supabase`) are not revalidated against the
+  users table. Tokens issued before the upgrade need no action.
+- **No takeover through a window.** Admin-issued reset redemption and admin set-password
+  write the password in one transaction, conditional on the roles value that was judged
+  non-administrator; a promotion that lands in between is refused (generic `401` for a
+  link, burning it; `409` for set-password) and emits `auth.credential_refused`.
+- **Provenance.** Email and password written by an administrator other than the holder
+  are recorded per field (`auth_account_state`) and stay recorded. Promoting such an
+  account returns `409 identity_set_by_other_admin` unless that request carries
+  `accept_identity_set_by_other`; the acceptance is recorded and audited in
+  `auth.admin_promoted`. The UI must not retry it silently.
+- **Act-limited sessions** (impersonation, magic link) end when the target becomes an
+  administrator, unless `AUTH_ADMIN_CROSS_CONTROL=true`.
+- **Exported Go API is for trusted callers**: `SetPassword` and friends skip the
+  admin-target rules, provenance and compare-and-set.
+
 ## Configuration
 `AUTH_SECRET`, `AUTH_DRIVER` (base|supabase), `AUTH_TTL_HOURS`, `AUTH_MIN_PASSWORD`,
 `CORS_ORIGINS`, `COOKIE_SECURE`, `APP_ENV`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
