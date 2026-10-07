@@ -46,6 +46,9 @@ func (s *Service) ensureAdminSchema(ctx context.Context) error {
 			jti text PRIMARY KEY,
 			expires_at text NOT NULL
 		)`,
+		// Which administrator issued an admin-issued reset token; self-service
+		// (forgot-password) tokens have no row here.
+		`CREATE TABLE IF NOT EXISTS auth_reset_issuers (token_hash text PRIMARY KEY, created_by text NOT NULL)`,
 		// One sentinel row, locked by every admin mutation (see adminTx).
 		`CREATE TABLE IF NOT EXISTS auth_admin_guard (id integer PRIMARY KEY, n integer NOT NULL DEFAULT 0)`,
 		`INSERT INTO auth_admin_guard (id, n) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
@@ -123,6 +126,12 @@ func (s *Service) issueLinkToken(ctx context.Context, table, createdBy, userID s
 	} else {
 		ins = "INSERT INTO auth_password_resets (token_hash, user_id, expires_at, used) VALUES (" + s.ph(1) + ", " + s.ph(2) + ", " + s.ph(3) + ", '')"
 		args = append(args, stamp(exp))
+		if createdBy != "" {
+			//#nosec G202 -- dialect placeholders only; values parameterized
+			if _, err := tx.ExecContext(ctx, "INSERT INTO auth_reset_issuers (token_hash, created_by) VALUES ("+s.ph(1)+", "+s.ph(2)+")", sha256hex(token), createdBy); err != nil {
+				return "", time.Time{}, err
+			}
+		}
 	}
 	//#nosec G202 -- constant statements; dialect placeholders only
 	if _, err := tx.ExecContext(ctx, ins, args...); err != nil {
@@ -138,8 +147,8 @@ func (s *Service) createMagicToken(ctx context.Context, userID, createdBy string
 	return s.issueLinkToken(ctx, "auth_magic_links", createdBy, userID, MagicLinkTTL)
 }
 
-func (s *Service) createAdminResetToken(ctx context.Context, userID string) (string, time.Time, error) {
-	return s.issueLinkToken(ctx, "auth_password_resets", "", userID, PasswordResetTTL)
+func (s *Service) createAdminResetToken(ctx context.Context, userID, createdBy string) (string, time.Time, error) {
+	return s.issueLinkToken(ctx, "auth_password_resets", createdBy, userID, PasswordResetTTL)
 }
 
 // handleMagicConsume redeems a magic link: it burns the token, starts a session
@@ -200,6 +209,12 @@ func (s *Service) handleMagicConsume(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.SecondFactorRequired(ctx, u.ID) {
 		writeErr(w, http.StatusForbidden, "second factor required; sign in with your password")
+		return
+	}
+	// A link an admin issued for an ordinary user must not outlive that user
+	// becoming an administrator (no admin-to-admin takeover by default).
+	if issuer != "" && isAdminUser(u) && !crossControlAllowed() {
+		invalid()
 		return
 	}
 	id := *u.identity(s.def)

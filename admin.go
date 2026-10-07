@@ -270,7 +270,9 @@ func (s *Service) countAdmins(ctx context.Context) (int, error) {
 // malformed one is answered with a generic 400 (never the decoder's message).
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAdminBody)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil && !errors.Is(err, io.EOF) {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
 		return false
 	}
@@ -529,7 +531,8 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	id := chi.URLParam(r, "id")
-	var updated *User
+	var updated, before *User
+	crossOp := ""
 	fields := []string{}
 	err := s.adminTx(ctx, func(tx *sql.Tx) error {
 		u, err := s.txUser(ctx, tx, id)
@@ -538,6 +541,17 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		}
 		if u == nil {
 			return &httpError{http.StatusNotFound, "user not found"}
+		}
+		// Another administrator's identity and privileges are off limits by
+		// default: a role change plus an email change plus a reset (or a
+		// demotion and re-promotion) would otherwise be a takeover. Self-edits,
+		// promoting a non-admin and deleting stay allowed (and audited).
+		if (body.Roles != nil || body.Permissions != nil || (body.Email != nil && email != u.Email)) && isAdminUser(u) {
+			if err := s.adminTargetErr(r, u); err != nil {
+				return err
+			}
+			before = u
+			crossOp = "update"
 		}
 		sets, args := []string{}, []any{}
 		add := func(col string, v any) {
@@ -586,6 +600,9 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.failAdmin(w, "update user", err)
 		return
+	}
+	if crossOp != "" && len(fields) > 0 {
+		s.auditCross(ctx, actorOf(r), before, "update:"+strings.Join(fields, ","))
 	}
 	if len(fields) > 0 {
 		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "target_id": updated.ID, "user_id": updated.ID, "fields": strings.Join(fields, ",")})
@@ -637,7 +654,7 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // refuseAdminTarget answers 403 and returns true when target is an
-// administrator other than the caller and AUTH_IMPERSONATE_ADMINS is not set.
+// administrator other than the caller and AUTH_ADMIN_CROSS_CONTROL is not set.
 // Impersonating, setting the password of, or minting a sign-in link for another
 // administrator are all ways of becoming them, so one rule covers all three.
 func (s *Service) refuseAdminTarget(w http.ResponseWriter, r *http.Request, target *User) bool {
@@ -648,10 +665,22 @@ func (s *Service) refuseAdminTarget(w http.ResponseWriter, r *http.Request, targ
 	return false
 }
 
+// auditCross records an operation performed on another administrator under the
+// AUTH_ADMIN_CROSS_CONTROL exception (a no-op for ordinary targets and
+// self-edits), naming actor, target, the operation and the policy used.
+func (s *Service) auditCross(ctx context.Context, actorID string, target *User, op string) {
+	if target == nil || target.ID == actorID || !isAdminUser(target) || !crossControlAllowed() {
+		return
+	}
+	s.fire(ctx, EventAdminCrossControl, map[string]string{
+		"actor_id": actorID, "target_id": target.ID, "operation": op, "policy": "AUTH_ADMIN_CROSS_CONTROL",
+	})
+}
+
 // adminTargetErr is refuseAdminTarget as an error, for use inside a transaction.
 func (s *Service) adminTargetErr(r *http.Request, target *User) error {
 	actor, _ := IdentityFrom(r.Context())
-	if actor == nil || target.ID == actor.ID || !isAdminUser(target) || impersonateAdminsAllowed() {
+	if actor == nil || target.ID == actor.ID || !isAdminUser(target) || crossControlAllowed() {
 		return nil
 	}
 	s.deny(r, actor)
@@ -681,6 +710,7 @@ func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 	if body.Password != "" {
 		switch err := s.setPasswordBy(ctx, u.ID, body.Password, actorOf(r)); {
 		case err == nil:
+			s.auditCross(ctx, actorOf(r), u, "set-password")
 			writeJSON(w, http.StatusOK, map[string]any{"reset": true})
 		case errors.Is(err, errPolicy), errors.Is(err, errTooLong):
 			writeErr(w, http.StatusUnprocessableEntity, err.Error())
@@ -692,12 +722,13 @@ func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// No password: hand the administrator a single-use reset link.
-	token, exp, err := s.createAdminResetToken(ctx, u.ID)
+	token, exp, err := s.createAdminResetToken(ctx, u.ID, actorOf(r))
 	if err != nil {
 		s.adminInternal(w, "create reset link", err)
 		return
 	}
 	expires := exp.Format(time.RFC3339)
+	s.auditCross(ctx, actorOf(r), u, "reset-link")
 	s.fire(ctx, EventAdminResetLinkIssued, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "expires_at": expires})
 	writeJSON(w, http.StatusOK, map[string]any{"link": resetLink(token), "emailed": false, "expires_at": expires})
 }
@@ -722,6 +753,7 @@ func (s *Service) adminMagicLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expires := exp.Format(time.RFC3339)
+	s.auditCross(ctx, actorOf(r), u, "magic-link")
 	s.fire(ctx, EventMagicLinkIssued, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "expires_at": expires})
 	writeJSON(w, http.StatusOK, map[string]any{"link": magicLink(token), "emailed": false, "expires_at": expires})
 }

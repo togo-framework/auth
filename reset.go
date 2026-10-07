@@ -114,6 +114,19 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		invalid()
 		return
 	}
+	// A token an administrator issued for an ordinary user stops working once
+	// that user is an administrator (unless AUTH_ADMIN_CROSS_CONTROL is on).
+	// Self-service forgot-password tokens have no issuer row and are unaffected.
+	if !crossControlAllowed() {
+		var issuer string
+		//#nosec G202 -- dialect placeholder only; value parameterized
+		if db.QueryRowContext(ctx, "SELECT created_by FROM auth_reset_issuers WHERE token_hash = "+s.ph(1), hashResetToken(strings.TrimSpace(body.Token))).Scan(&issuer) == nil {
+			if target, err := s.userByID(ctx, userID); err != nil || target == nil || isAdminUser(target) {
+				invalid()
+				return
+			}
+		}
+	}
 	hash, err := hashPassword(body.Password)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})

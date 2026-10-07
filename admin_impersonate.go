@@ -29,9 +29,10 @@ import (
 //   - it can not reach the admin API, nor change the borrowed account's password,
 //     2FA, PIN or API tokens.
 //
-// Impersonating another administrator is refused unless
-// AUTH_IMPERSONATE_ADMINS=true: it would hand one administrator another's
-// powers under another's name, so it is opt-in. Impersonating yourself is
+// Impersonating another administrator is refused unless the single
+// AUTH_ADMIN_CROSS_CONTROL=true policy is on (it governs every cross-admin
+// operation and audits each use): it would hand one administrator another's
+// powers under another's name. Impersonating yourself is
 // refused as pointless.
 
 const (
@@ -52,8 +53,8 @@ func impersonationTTL() time.Duration {
 	return defaultImpersonationTTL
 }
 
-func impersonateAdminsAllowed() bool {
-	return strings.EqualFold(os.Getenv("AUTH_IMPERSONATE_ADMINS"), "true")
+func crossControlAllowed() bool {
+	return strings.EqualFold(os.Getenv("AUTH_ADMIN_CROSS_CONTROL"), "true")
 }
 
 func (s *Service) adminImpersonate(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +91,7 @@ func (s *Service) adminImpersonate(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	exp := now.Add(ttl)
+	s.auditCross(ctx, actor.ID, target, "impersonate")
 	s.fire(ctx, EventUserImpersonated, map[string]string{
 		"actor_id": actor.ID, "target_id": target.ID, "at": stamp(now), "expires_at": stamp(exp),
 	})

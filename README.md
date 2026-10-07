@@ -61,17 +61,23 @@ Events: `auth.user_created|updated|deleted|impersonated`, `auth.impersonation_en
 never carry a token or link. See `SECURITY.md` for the policy.
 
 Rules for acting on another administrator: impersonate, `reset-password`, `magic-link`
-and changing their `email` (PATCH) are refused with 403 unless `AUTH_IMPERSONATE_ADMINS=true`;
-self-edits are always allowed. Changing roles or permissions of, or deleting, another admin
-is allowed (the last administrator is always protected) and audited: `auth.user_updated`
-carries `actor_id`, `target_id` and the changed field names (no values); `auth.user_deleted`
-carries `actor_id` and `target_id`. A magic link redeemed for a user starts a session that
+and changing their `email`, `roles` or `permissions` (PATCH) are all refused with 403 by
+default. `AUTH_ADMIN_CROSS_CONTROL=true` is the single, explicitly privileged opt-in that
+relaxes every one of these admin-target restrictions (it is the only such flag; it is
+configuration only and cannot be granted through the API). Each cross-admin operation done
+under it emits `auth.admin_cross_control` (`actor_id`, `target_id`, `operation`, `policy`). Always allowed: self-edits (including self-demotion, subject to the
+last-administrator rule), promoting a non-admin to admin, and deleting another admin (no session
+is created as them; the last administrator is always protected). These are audited:
+`auth.user_updated` carries `actor_id`, `target_id` and the changed field names (no values);
+`auth.user_deleted` carries `actor_id` and `target_id`. Reset and magic links an admin issued
+for an ordinary user stop working if that user has since become an admin (unless the opt-in is
+on); self-service forgot-password tokens are unaffected. Request bodies reject unknown fields. A magic link redeemed for a user starts a session that
 names the issuing admin (`impersonator`, `act` claim, `auth.login` event, plus
 `auth.magic_link_redeemed`) and lasts as long as an impersonation.
 
 Config: `AUTH_PUBLIC_URL`/`APP_URL` (link base), `AUTH_RESET_PATH` (default `/reset-password`),
 `AUTH_POST_LOGIN_URL`, `AUTH_IMPERSONATION_TTL_MINUTES` (default 30, max 480),
-`AUTH_IMPERSONATE_ADMINS` (default off).
+`AUTH_ADMIN_CROSS_CONTROL` (default off; the only switch for cross-admin control).
 
 Token verification: `Verify(token)` now delegates to `VerifyContext(ctx, token)`, which also
 enforces revocation and the actor/target checks for impersonation tokens (a database lookup).

@@ -35,6 +35,10 @@ const (
 	EventMagicLinkIssued = "auth.magic_link_issued"
 	// EventMagicLinkRedeemed: actor_id (the issuing admin), target_id, at.
 	EventMagicLinkRedeemed = "auth.magic_link_redeemed"
+	// EventAdminCrossControl is fired for every operation one administrator
+	// performs on another under the AUTH_ADMIN_CROSS_CONTROL exception:
+	// actor_id, target_id, operation, policy ("AUTH_ADMIN_CROSS_CONTROL").
+	EventAdminCrossControl = "auth.admin_cross_control"
 	// EventAdminResetLinkIssued: actor_id, user_id, expires_at (no link).
 	EventAdminResetLinkIssued = "auth.admin_reset_link_issued"
 )

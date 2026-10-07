@@ -58,26 +58,26 @@ func TestReviewAdminToAdminImpersonation(t *testing.T) {
 	ctx := context.Background()
 	second, _ := w.svc.CreateUser(ctx, "second@example.com", pw, []string{"editor", "admin"})
 	for _, v := range []string{"", "false", "1", "yes", "on", "truee", " true", "TRUE "} {
-		t.Setenv("AUTH_IMPERSONATE_ADMINS", v)
+		t.Setenv("AUTH_ADMIN_CROSS_CONTROL", v)
 		code, _ := impersonate(t, w, w.adminTok, second.ID)
 		want := 403
 		if strings.EqualFold(v, "true") {
 			want = 200
 		}
 		if code != want {
-			t.Errorf("AUTH_IMPERSONATE_ADMINS=%q: got %d want %d", v, code, want)
+			t.Errorf("AUTH_ADMIN_CROSS_CONTROL=%q: got %d want %d", v, code, want)
 		}
 	}
 	for _, roles := range [][]string{{"admin"}, {"a", "admin", "z"}, {" admin "}, {"admin", "admin"}} {
 		if err := w.svc.SetRoles(ctx, second.ID, roles); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("AUTH_IMPERSONATE_ADMINS", "")
+		t.Setenv("AUTH_ADMIN_CROSS_CONTROL", "")
 		if code, _ := impersonate(t, w, w.adminTok, second.ID); code == 200 {
 			t.Errorf("SECURITY admin impersonated with roles %v", roles)
 		}
 	}
-	t.Setenv("AUTH_IMPERSONATE_ADMINS", "true")
+	t.Setenv("AUTH_ADMIN_CROSS_CONTROL", "true")
 	if err := w.svc.SetRoles(ctx, second.ID, []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestReviewAdminToAdminImpersonation(t *testing.T) {
 // resulting session carries no act claim.
 func TestReviewAdminCanNotTakeOverAnotherAdminByOtherMeans(t *testing.T) {
 	w := newReviewWorld(t)
-	t.Setenv("AUTH_IMPERSONATE_ADMINS", "")
+	t.Setenv("AUTH_ADMIN_CROSS_CONTROL", "")
 	second, _ := w.svc.CreateUser(context.Background(), "second@example.com", pw, []string{"admin"})
 	code, _, _ := raw(t, w.srv, "POST", "/api/auth/admin/users/"+second.ID+"/magic-link", w.adminTok, map[string]string{})
 	if code == 200 {

@@ -715,7 +715,7 @@ func TestImpersonationAdminPolicy(t *testing.T) {
 	if code := imp("missing"); code != http.StatusNotFound {
 		t.Fatalf("unknown target: %d", code)
 	}
-	t.Setenv("AUTH_IMPERSONATE_ADMINS", "true")
+	t.Setenv("AUTH_ADMIN_CROSS_CONTROL", "true")
 	if code := imp(other.ID); code != http.StatusOK {
 		t.Fatalf("allowed by config: %d", code)
 	}
@@ -790,8 +790,7 @@ func TestImpersonationDiesWhenTheActorIsNoLongerAdmin(t *testing.T) {
 	}
 }
 
-// Admins manage admins: role changes and deletes of another administrator are
-// allowed, but audited with actor and target (field names only, no values).
+// Promoting a non-admin and deleting another administrator are allowed, but audited with actor and target (field names only, no values).
 func TestAdminManagingAdminsIsAudited(t *testing.T) {
 	w := newAdminWorld(t)
 	two, err := w.svc.CreateUser(context.Background(), "two@example.com", pw, []string{"admin"})
@@ -800,15 +799,16 @@ func TestAdminManagingAdminsIsAudited(t *testing.T) {
 	}
 	updated := w.capture(EventUserUpdated)
 	deleted := w.capture(EventUserDeleted)
-	base := "/api/auth/admin/users/" + two.ID
-	if code, _, _ := raw(t, w.srv, http.MethodPatch, base, w.adminTok, map[string]any{"roles": []string{"editor"}, "permissions": []string{"x"}}); code != http.StatusOK {
-		t.Fatalf("role change of another admin: %d", code)
+	_ = two
+	base := "/api/auth/admin/users/" + w.userID
+	if code, _, _ := raw(t, w.srv, http.MethodPatch, base, w.adminTok, map[string]any{"roles": []string{"admin"}, "permissions": []string{"x"}}); code != http.StatusOK {
+		t.Fatalf("promoting a non-admin: %d", code)
 	}
 	if len(*updated) != 1 {
 		t.Fatalf("updated events: %d", len(*updated))
 	}
 	u := (*updated)[0].(map[string]string)
-	if u["actor_id"] != w.adminID || u["target_id"] != two.ID || u["fields"] != "roles,permissions" {
+	if u["actor_id"] != w.adminID || u["target_id"] != w.userID || u["fields"] != "roles,permissions" {
 		t.Fatalf("update event: %v", u)
 	}
 	// Demoted, the account is an ordinary user again; delete another admin.
