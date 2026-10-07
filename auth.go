@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -106,6 +107,13 @@ type Identity struct {
 	Roles       []string `json:"roles"`
 	Permissions []string `json:"permissions"`
 	Guard       string   `json:"guard"`
+	// Impersonator is the id of the administrator acting as this identity. It is
+	// empty for every real login, and set only on tokens issued through
+	// POST /api/auth/admin/users/{id}/impersonate (the token's `act.sub` claim).
+	Impersonator string `json:"impersonator,omitempty"`
+	// TokenID is the token's jti. It is set only on impersonation tokens, which
+	// are revocable.
+	TokenID string `json:"-"`
 }
 
 // Can reports whether the identity has a permission.
@@ -136,6 +144,7 @@ type Service struct {
 	def           string
 	sessions      SessionStore // nil => stateless cookie sessions
 	sessionDriver string
+	adminMu       sync.Mutex // serialises admin mutations that guard the last-admin invariant
 }
 
 // New builds the service, ensures the users table exists, and registers the
@@ -175,6 +184,9 @@ func New(k *togo.Kernel) (*Service, error) {
 		return nil, err
 	}
 	if err := s.ensureResetSchema(context.Background()); err != nil {
+		return nil, err
+	}
+	if err := s.ensureAdminSchema(context.Background()); err != nil {
 		return nil, err
 	}
 	s.RegisterGuard("api", &dbAuthenticator{s: s})
@@ -226,6 +238,13 @@ func (s *Service) ensureSchema(ctx context.Context) error {
 
 // IssueToken signs a JWT for an identity.
 func (s *Service) IssueToken(id Identity) (string, error) {
+	return s.signToken(id, s.ttl)
+}
+
+// signToken signs a JWT for id valid for ttl. An identity with an Impersonator
+// gets an `act` claim (RFC 8693) naming the acting administrator and a jti, so
+// the token is distinguishable from a login and can be revoked.
+func (s *Service) signToken(id Identity, ttl time.Duration) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"sub":   id.ID,
@@ -236,7 +255,11 @@ func (s *Service) IssueToken(id Identity) (string, error) {
 		"iss":   "togo",
 		"iat":   now.Unix(),
 		"nbf":   now.Unix(),
-		"exp":   now.Add(s.ttl).Unix(),
+		"exp":   now.Add(ttl).Unix(),
+	}
+	if id.Impersonator != "" {
+		claims["act"] = map[string]string{"sub": id.Impersonator}
+		claims["jti"] = genID()
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
 }
@@ -255,13 +278,18 @@ func (s *Service) Verify(token string) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Identity{
+	id := &Identity{
 		ID:          str(claims["sub"]),
 		Email:       str(claims["email"]),
 		Roles:       splitCSV(str(claims["roles"])),
 		Permissions: splitCSV(str(claims["perms"])),
 		Guard:       str(claims["guard"]),
-	}, nil
+	}
+	if act, ok := claims["act"].(map[string]any); ok {
+		id.Impersonator = str(act["sub"])
+		id.TokenID = str(claims["jti"])
+	}
+	return id, nil
 }
 
 // hash + compare helpers.

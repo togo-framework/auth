@@ -24,9 +24,27 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
 - **RBAC / multi-guard**: roles + permissions on the identity; `RequireRole` /
   `RequirePermission` middleware; named guards.
 
+- **Admin API** (`/api/auth/admin/*`, v0.10.0): authenticated is not administrator.
+  Every route re-reads the caller from the database and requires the `admin` role
+  (anonymous -> 401, non-admin -> 403; a demoted admin loses access at once, API
+  tokens and impersonated sessions never qualify). Writes need CSRF for cookie
+  sessions. The last administrator cannot be deleted or demoted.
+- **Magic / reset links**: 256-bit random token, only its SHA-256 stored, single-use
+  (atomic consume), 15 min (magic) / 30 min (reset), purpose-bound, superseded by
+  the next link for the account, never in events or logs. The base URL is only
+  `AUTH_PUBLIC_URL` / `APP_URL`; unset means a relative path, never the Host header.
+  A magic link does not bypass 2FA.
+- **Impersonation**: token carries `act.sub` (the admin) + `jti`, 30 min default
+  (`AUTH_IMPERSONATION_TTL_MINUTES`, max 480), audit events name actor and target,
+  revocable via `POST /api/auth/impersonation/stop`, dies if the admin is demoted,
+  cannot call the admin API or change the borrowed account's password/2FA/PIN/tokens.
+  Impersonating another admin is refused unless `AUTH_IMPERSONATE_ADMINS=true`.
+
 ## Configuration
 `AUTH_SECRET`, `AUTH_DRIVER` (base|supabase), `AUTH_TTL_HOURS`, `AUTH_MIN_PASSWORD`,
-`CORS_ORIGINS`, `COOKIE_SECURE`, `APP_ENV`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`.
+`CORS_ORIGINS`, `COOKIE_SECURE`, `APP_ENV`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`AUTH_PUBLIC_URL` (or `APP_URL`), `AUTH_RESET_PATH`, `AUTH_POST_LOGIN_URL`,
+`AUTH_IMPERSONATION_TTL_MINUTES`, `AUTH_IMPERSONATE_ADMINS`.
 
 ## Reporting
 Report vulnerabilities privately via a GitHub security advisory on this repo.

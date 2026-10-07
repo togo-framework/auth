@@ -29,7 +29,18 @@ func (s *Service) authenticate(r *http.Request) (*Identity, error) {
 			return s.patIdentity(r.Context(), raw)
 		}
 	}
-	return s.Verify(s.resolveToken(r))
+	id, err := s.Verify(s.resolveToken(r))
+	if err != nil {
+		return nil, err
+	}
+	if id.Impersonator != "" {
+		// An impersonation token is only as good as the administrator behind it:
+		// it stops working when it is ended, or the actor or target is gone.
+		if err := s.checkImpersonation(r.Context(), id); err != nil {
+			return nil, err
+		}
+	}
+	return id, nil
 }
 
 func (s *Service) ensurePATSchema(ctx context.Context) error {

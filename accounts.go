@@ -84,6 +84,12 @@ func (s *Service) CreateUser(ctx context.Context, email, password string, roles 
 // who cannot receive a reset link. The password policy applies, and
 // EventPasswordChanged fires as it does for a self-service change.
 func (s *Service) SetPassword(ctx context.Context, userID, password string) error {
+	return s.setPasswordBy(ctx, userID, password, "")
+}
+
+// setPasswordBy is SetPassword with the acting administrator recorded in the
+// event (actorID may be empty).
+func (s *Service) setPasswordBy(ctx context.Context, userID, password, actorID string) error {
 	if err := validatePassword(password); err != nil {
 		return err
 	}
@@ -103,6 +109,10 @@ func (s *Service) SetPassword(ctx context.Context, userID, password string) erro
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrUserNotFound
 	}
-	s.fire(ctx, EventPasswordChanged, map[string]string{"user_id": userID, "by": "admin"})
+	payload := map[string]string{"user_id": userID, "by": "admin"}
+	if actorID != "" {
+		payload["actor_id"] = actorID
+	}
+	s.fire(ctx, EventPasswordChanged, payload)
 	return nil
 }

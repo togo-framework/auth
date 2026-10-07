@@ -35,6 +35,31 @@ togo install togo-framework/auth
 ```
 
 
+## Admin user management
+
+Mounted at `/api/auth/admin/*` for the built-in driver (`AUTH_DRIVER=base`). All
+routes require the `admin` role, re-checked against the database on every request
+(401 anonymous, 403 non-admin). Cookie-authenticated writes need `X-CSRF-Token`
+(from `GET /api/auth/csrf`); bearer requests are exempt.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /users?q=&limit=&offset=` | | `[{id,email,roles[],permissions[],created_at}]` (limit default 100, max 500) |
+| `POST /users` | `{email, password?, roles?, permissions?}` | `201 {user}` |
+| `GET /users/{id}` | | user |
+| `PATCH /users/{id}` | `{email?, roles?, permissions?}` | user |
+| `DELETE /users/{id}` | | `{deleted:true,id}` |
+| `POST /users/{id}/impersonate` | | `{token, identity{..., impersonator}, expires_at}` |
+| `POST /users/{id}/reset-password` | `{password?}` | `{reset:true}` or `{link, emailed:false, expires_at}` |
+| `POST /users/{id}/magic-link` | | `{link, emailed:false, expires_at}` |
+
+Also: `GET /api/auth/magic?token=` (redeems a magic link, 302 to
+`AUTH_POST_LOGIN_URL`), `POST /api/auth/impersonation/stop` (ends an impersonation),
+and `GET /api/auth/me`, which includes `impersonator` (the admin's id) while impersonating.
+Events: `auth.user_created|updated|deleted|impersonated`, `auth.impersonation_ended`,
+`auth.magic_link_issued`, `auth.admin_reset_link_issued`. Payloads name the actor and
+never carry a token or link. See `SECURITY.md` for the policy.
+
 ## Frontend
 
 UI lives in the separate [dashboard](https://github.com/togo-framework/dashboard)
