@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -114,61 +116,98 @@ func (s *Service) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		invalid()
 		return
 	}
-	// A token an administrator issued for an ordinary user stops working once
-	// that user is an administrator (unless AUTH_ADMIN_CROSS_CONTROL is on).
-	// Self-service forgot-password tokens have no issuer row and are unaffected.
-	if !crossControlAllowed() {
-		var issuer string
-		//#nosec G202 -- dialect placeholder only; value parameterized
-		if db.QueryRowContext(ctx, "SELECT created_by FROM auth_reset_issuers WHERE token_hash = "+s.ph(1), hashResetToken(strings.TrimSpace(body.Token))).Scan(&issuer) == nil {
-			if target, err := s.userByID(ctx, userID); err != nil || target == nil || isAdminUser(target) {
-				invalid()
-				return
-			}
-		}
-	}
-	hash, err := hashPassword(body.Password)
+	hash, err := hashPassword(body.Password) // before the transaction: bcrypt must not hold a connection
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
 		return
 	}
-	// Redeeming is one conditional UPDATE: of any number of concurrent requests
-	// with the same token exactly one sees a row affected and may set the
-	// password. Burning the token and setting the password commit together.
+	failed := func() { writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"}) }
+	tokenHash := hashResetToken(strings.TrimSpace(body.Token))
+	// One transaction: burn the token, read the issuer and the user, and write
+	// the password only while the roles value that was judged is still stored.
+	// Everything inside uses the transaction (SQLite has one connection).
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		failed()
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
 	//#nosec G202 -- dialect placeholders only; values parameterized
-	res, err := tx.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE token_hash = "+s.ph(1)+" AND used = ''", hashResetToken(strings.TrimSpace(body.Token)))
+	res, err := tx.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE token_hash = "+s.ph(1)+" AND used = ''", tokenHash)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		failed()
 		return
 	}
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		invalid()
 		return
 	}
-	//#nosec G202 -- dialect placeholders only; values parameterized
-	pw, err := tx.ExecContext(ctx, "UPDATE users SET password_hash = "+s.ph(1)+" WHERE id = "+s.ph(2), hash, userID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+	var issuer string
+	//#nosec G202 -- dialect placeholder only; value parameterized
+	switch err := tx.QueryRowContext(ctx, "SELECT created_by FROM auth_reset_issuers WHERE token_hash = "+s.ph(1), tokenHash).Scan(&issuer); {
+	case errors.Is(err, sql.ErrNoRows):
+		issuer = ""
+	case err != nil:
+		failed()
 		return
 	}
-	if n, err := pw.RowsAffected(); err != nil || n != 1 {
-		invalid() // the account is gone; the rollback un-burns nothing useful
+	target, err := s.txUser(ctx, tx, userID)
+	if err != nil {
+		failed()
 		return
+	}
+	if target == nil {
+		invalid() // the account is gone; the burn is rolled back with nothing else to keep
+		return
+	}
+	if issuer == "" {
+		// Self-service token: the holder resets their own password.
+		//#nosec G202 -- dialect placeholders only; values parameterized
+		pw, err := tx.ExecContext(ctx, "UPDATE users SET password_hash = "+s.ph(1)+" WHERE id = "+s.ph(2), hash, userID)
+		if err != nil {
+			failed()
+			return
+		}
+		if n, err := pw.RowsAffected(); err != nil || n != 1 {
+			invalid()
+			return
+		}
+	} else {
+		// An administrator-issued token stops working once the account is an
+		// administrator (unless AUTH_ADMIN_CROSS_CONTROL is on). The write is
+		// compare-and-set on the roles value just judged, so a promotion that
+		// commits between the read and the write is refused. A refusal commits
+		// the burn: the token is dead either way.
+		ok := crossControlAllowed() || !isAdminUser(target)
+		if ok {
+			ok, err = s.txSetPasswordIfRoles(ctx, tx, userID, hash, target.Roles)
+			if err != nil {
+				failed()
+				return
+			}
+		}
+		if !ok {
+			if err := tx.Commit(); err != nil {
+				failed()
+				return
+			}
+			s.fire(ctx, EventCredentialRefused, map[string]string{"type": "reset", "issuer": issuer, "target_id": userID})
+			invalid()
+			return
+		}
+		if err := s.markProvenance(ctx, tx, userID, fieldPassword, issuer); err != nil {
+			failed()
+			return
+		}
 	}
 	// Burn any other outstanding tokens for the user.
 	//#nosec G202 -- dialect placeholders only; values parameterized
 	if _, err := tx.ExecContext(ctx, "UPDATE auth_password_resets SET used = 'true' WHERE user_id = "+s.ph(1), userID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		failed()
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reset failed"})
+		failed()
 		return
 	}
 	s.fire(ctx, EventPasswordReset, map[string]string{"user_id": userID})

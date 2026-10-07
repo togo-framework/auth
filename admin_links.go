@@ -52,6 +52,9 @@ func (s *Service) ensureAdminSchema(ctx context.Context) error {
 		// One sentinel row, locked by every admin mutation (see adminTx).
 		`CREATE TABLE IF NOT EXISTS auth_admin_guard (id integer PRIMARY KEY, n integer NOT NULL DEFAULT 0)`,
 		`INSERT INTO auth_admin_guard (id, n) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
+		// Who set an account's email and password when it was not the holder (see
+		// admin_state.go). A side table: users is host-owned and never altered.
+		ensureAccountStateSQL(),
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return err

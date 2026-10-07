@@ -166,5 +166,11 @@ func (s *Service) checkImpersonation(ctx context.Context, id *Identity) error {
 	if target == nil {
 		return errImpersonationInvalid
 	}
+	// An act-limited session (impersonation or magic link) must not outlive
+	// the target becoming an administrator: it would be a way into that
+	// account that the cross-control rule forbids at issue time.
+	if isAdminUser(target) && !crossControlAllowed() {
+		return errImpersonationInvalid
+	}
 	return nil
 }

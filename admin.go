@@ -19,9 +19,12 @@ import (
 // Admin user management: /api/auth/admin/*.
 //
 // Authenticated does not mean administrator. Every route here goes through
-// requireAdmin, which authenticates the caller and then re-reads the account
-// from the database, so a token minted before a demotion or deletion stops
-// working at once. A caller with no valid credentials gets 401; a signed-in
+// requireAdmin, which authenticates the caller (authenticate revalidates the
+// account against the database on every request) and requires the admin role
+// from that current record, so a token minted before a demotion or deletion
+// stops working at once. Each mutation re-checks the caller inside its own
+// transaction too (adminTx), so a demotion that commits while a request is in
+// flight is honoured at the write. A caller with no valid credentials gets 401; a signed-in
 // user who is not an administrator gets 403. Writes also carry the plugin's
 // double-submit CSRF guard (bearer requests are exempt, as everywhere else).
 //
@@ -109,24 +112,20 @@ func (s *Service) requireAdmin(next http.Handler) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := r.Context()
-		u, err := s.userByID(ctx, id.ID)
-		if err != nil {
-			s.adminInternal(w, "load caller", err)
-			return
-		}
-		if u == nil {
-			writeErr(w, http.StatusUnauthorized, "unauthorized") // deleted account
-			return
-		}
+		// authenticate has already replaced the token's roles with the account's
+		// current ones and refused a deleted account (revalidate), so HasRole is
+		// the database's answer, not a claim.
+		//
 		// An API token is scoped by its abilities and an impersonated session is
 		// borrowed: neither may act with the owner's administrator role.
-		if id.Guard == "pat" || id.Impersonator != "" || !isAdminUser(u) {
+		if id.Guard == "pat" || id.Impersonator != "" || !id.HasRole(adminRole) {
 			s.deny(r, id)
 			writeErr(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, ctxKey{}, u.identity(s.def))))
+		caller := *id
+		caller.Guard = s.def
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, &caller)))
 	})
 }
 
@@ -331,17 +330,22 @@ func (s *Service) adminGetUser(w http.ResponseWriter, r *http.Request) {
 type httpError struct {
 	status int
 	msg    string
+	body   any // optional JSON body that replaces {"error": msg}
 }
 
 func (e *httpError) Error() string { return e.msg }
 
-func conflict(msg string) error { return &httpError{http.StatusConflict, msg} }
+func conflict(msg string) error { return &httpError{status: http.StatusConflict, msg: msg} }
 
 // failAdmin answers err: a client-safe httpError as is, anything else as a
 // logged, generic 500.
 func (s *Service) failAdmin(w http.ResponseWriter, op string, err error) {
 	var he *httpError
 	if errors.As(err, &he) {
+		if he.body != nil {
+			writeJSON(w, he.status, he.body)
+			return
+		}
 		writeErr(w, he.status, he.msg)
 		return
 	}
@@ -366,6 +370,14 @@ func (s *Service) adminTx(ctx context.Context, fn func(tx *sql.Tx) error) error 
 	if _, err := tx.ExecContext(ctx, "UPDATE auth_admin_guard SET n = n + 1 WHERE id = 1"); err != nil {
 		return err
 	}
+	// The caller was judged an administrator before the transaction began; judge
+	// again now that the guard is held, so a demotion or deletion that committed
+	// in between stops the write.
+	if actor, ok := IdentityFrom(ctx); ok {
+		if err := s.txRequireAdmin(ctx, tx, actor.ID); err != nil {
+			return err
+		}
+	}
 	if err := fn(tx); err != nil {
 		return err
 	}
@@ -388,6 +400,55 @@ func (s *Service) txUser(ctx context.Context, tx *sql.Tx, id string) (*User, err
 		return nil, err
 	}
 	return &u, nil
+}
+
+// txRequireAdmin fails unless actorID is, inside tx, an existing administrator.
+func (s *Service) txRequireAdmin(ctx context.Context, tx *sql.Tx, actorID string) error {
+	a, err := s.txUser(ctx, tx, actorID)
+	if err != nil {
+		return err
+	}
+	if a == nil {
+		return &httpError{status: http.StatusUnauthorized, msg: "unauthorized"}
+	}
+	if !isAdminUser(a) {
+		return &httpError{status: http.StatusForbidden, msg: "forbidden"}
+	}
+	return nil
+}
+
+// txLockUser takes the row lock on one account with a no-op UPDATE (portable:
+// SQLite has no FOR UPDATE, and it serialises writers anyway). It reports
+// whether the account exists. Everything read after it in the same transaction
+// is the state left by the previous writer, and writers that come later wait.
+func (s *Service) txLockUser(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	if !plausibleID(id) {
+		return false, nil
+	}
+	//#nosec G202 -- dialect placeholder only; value parameterized
+	res, err := tx.ExecContext(ctx, "UPDATE users SET roles = roles WHERE id = "+s.ph(1), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// txSetPasswordIfRoles is the effect statement of every credential write that an
+// administrator influenced: the password changes only if the account's roles
+// are still exactly the value that was read and judged non-administrator, in
+// the same statement. It reports whether a row changed; false means the account
+// changed under the operation (promoted, demoted, edited or deleted) and the
+// caller must refuse. Roles equality, not a LIKE test, because it is
+// dialect-neutral and exact.
+func (s *Service) txSetPasswordIfRoles(ctx context.Context, tx *sql.Tx, userID, hash, roles string) (bool, error) {
+	//#nosec G202 -- dialect placeholders only; values parameterized
+	res, err := tx.ExecContext(ctx, "UPDATE users SET password_hash = "+s.ph(1)+" WHERE id = "+s.ph(2)+" AND roles = "+s.ph(3), hash, userID, roles)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // emailTaken reports whether another account (not exceptID) already uses email
@@ -480,10 +541,20 @@ func (s *Service) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 			return conflict("a user with that email already exists")
 		}
 		//#nosec G202 -- dialect placeholders only; values parameterized
-		_, err := tx.ExecContext(ctx, "INSERT INTO users (id, email, password_hash, roles, permissions, created_at) VALUES ("+
+		if _, err := tx.ExecContext(ctx, "INSERT INTO users (id, email, password_hash, roles, permissions, created_at) VALUES ("+
 			s.ph(1)+", "+s.ph(2)+", "+s.ph(3)+", "+s.ph(4)+", "+s.ph(5)+", "+s.ph(6)+")",
-			u.ID, u.Email, u.PasswordHash, u.Roles, u.Permissions, u.CreatedAt)
-		return err
+			u.ID, u.Email, u.PasswordHash, u.Roles, u.Permissions, u.CreatedAt); err != nil {
+			return err
+		}
+		// The creator chose the email and, if given, knows the password: record
+		// both so a different administrator promoting this account must accept.
+		if err := s.markProvenance(ctx, tx, u.ID, fieldEmail, actorOf(r)); err != nil {
+			return err
+		}
+		if body.Password != "" {
+			return s.markProvenance(ctx, tx, u.ID, fieldPassword, actorOf(r))
+		}
+		return nil
 	})
 	if err != nil {
 		s.failAdmin(w, "create user", err)
@@ -498,6 +569,9 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		Email       *string   `json:"email"`
 		Roles       *[]string `json:"roles"`
 		Permissions *[]string `json:"permissions"`
+		// Accept confirms, for this one request, a promotion of an account whose
+		// email or password another administrator set (see admin_state.go).
+		Accept bool `json:"accept_identity_set_by_other"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -534,13 +608,47 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	var updated, before *User
 	crossOp := ""
 	fields := []string{}
+	var promoted, demoted, accepted bool
+	var tainted []string
 	err := s.adminTx(ctx, func(tx *sql.Tx) error {
+		// The target row lock is the first statement on the target: a redemption
+		// or password write holding it commits its provenance before it is read
+		// below, and a later one is refused by its own roles check.
+		found, err := s.txLockUser(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return &httpError{status: http.StatusNotFound, msg: "user not found"}
+		}
 		u, err := s.txUser(ctx, tx, id)
 		if err != nil {
 			return err
 		}
 		if u == nil {
-			return &httpError{http.StatusNotFound, "user not found"}
+			return &httpError{status: http.StatusNotFound, msg: "user not found"}
+		}
+		actorID := actorOf(r)
+		emailChanges := body.Email != nil && email != u.Email
+		promoted = body.Roles != nil && contains(roles, adminRole) && !isAdminUser(u)
+		demoted = body.Roles != nil && !contains(roles, adminRole) && isAdminUser(u)
+		if promoted {
+			// Provenance is read after the lock and before any write. An email this
+			// same request sets is the promoter's own, so it is exempt.
+			prov, err := s.readProvenance(ctx, tx, u.ID)
+			if err != nil {
+				return err
+			}
+			tainted = prov.taintedFields(u.ID, actorID, emailChanges)
+			if len(tainted) > 0 {
+				if !body.Accept {
+					return provenanceConflict(prov, tainted)
+				}
+				accepted = true
+				if err := s.recordAccept(ctx, tx, u.ID, actorID); err != nil {
+					return err
+				}
+			}
 		}
 		// Another administrator's identity and privileges are off limits by
 		// default: a role change plus an email change plus a reset (or a
@@ -573,6 +681,9 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 				return conflict("a user with that email already exists")
 			}
 			add("email", email)
+			if err := s.markProvenance(ctx, tx, u.ID, fieldEmail, actorID); err != nil {
+				return err
+			}
 		}
 		if body.Roles != nil {
 			if isAdminUser(u) && !contains(roles, adminRole) {
@@ -607,6 +718,12 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if len(fields) > 0 {
 		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "target_id": updated.ID, "user_id": updated.ID, "fields": strings.Join(fields, ",")})
 	}
+	if promoted {
+		s.fire(ctx, EventAdminPromoted, map[string]string{"actor_id": actorOf(r), "target_id": updated.ID, "tainted": strings.Join(tainted, ","), "accepted": strconv.FormatBool(accepted)})
+	}
+	if demoted {
+		s.fire(ctx, EventAdminDemoted, map[string]string{"actor_id": actorOf(r), "target_id": updated.ID})
+	}
 	writeJSON(w, http.StatusOK, toAdminUser(updated))
 }
 
@@ -619,7 +736,7 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if u == nil {
-			return &httpError{http.StatusNotFound, "user not found"}
+			return &httpError{status: http.StatusNotFound, msg: "user not found"}
 		}
 		if isAdminUser(u) {
 			if n, err := s.otherAdmins(ctx, tx, u.ID); err != nil {
@@ -635,6 +752,7 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 			{"DELETE FROM auth_magic_links WHERE user_id = ", u.ID},
 			{"DELETE FROM auth_totp WHERE subject = ", u.ID},
 			{"DELETE FROM auth_pins WHERE subject = ", u.ID},
+			{"DELETE FROM auth_account_state WHERE user_id = ", u.ID},
 			{"DELETE FROM otp_codes WHERE subject = ", u.Email},
 			{"DELETE FROM users WHERE id = ", u.ID},
 		} {
@@ -648,6 +766,9 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.failAdmin(w, "delete user", err)
 		return
+	}
+	if isAdminUser(gone) {
+		s.auditCross(ctx, actorOf(r), gone, "delete")
 	}
 	s.fire(ctx, EventUserDeleted, map[string]string{"actor_id": actorOf(r), "target_id": gone.ID, "user_id": gone.ID, "email": gone.Email})
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": gone.ID})
@@ -684,7 +805,7 @@ func (s *Service) adminTargetErr(r *http.Request, target *User) error {
 		return nil
 	}
 	s.deny(r, actor)
-	return &httpError{http.StatusForbidden, "administrators cannot be acted on this way"}
+	return &httpError{status: http.StatusForbidden, msg: "administrators cannot be acted on this way"}
 }
 
 func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
@@ -695,6 +816,20 @@ func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if body.Password != "" {
+		u, err := s.adminSetPassword(ctx, r, chi.URLParam(r, "id"), body.Password)
+		switch {
+		case err == nil:
+			s.auditCross(ctx, actorOf(r), u, "set-password")
+			s.fire(ctx, EventPasswordChanged, map[string]string{"user_id": u.ID, "by": "admin", "actor_id": actorOf(r)})
+			writeJSON(w, http.StatusOK, map[string]any{"reset": true})
+		case errors.Is(err, errPolicy), errors.Is(err, errTooLong):
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		default:
+			s.failAdmin(w, "set password", err)
+		}
+		return
+	}
 	u, err := s.userByID(ctx, chi.URLParam(r, "id"))
 	if err != nil {
 		s.adminInternal(w, "load user", err)
@@ -705,20 +840,6 @@ func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.refuseAdminTarget(w, r, u) {
-		return
-	}
-	if body.Password != "" {
-		switch err := s.setPasswordBy(ctx, u.ID, body.Password, actorOf(r)); {
-		case err == nil:
-			s.auditCross(ctx, actorOf(r), u, "set-password")
-			writeJSON(w, http.StatusOK, map[string]any{"reset": true})
-		case errors.Is(err, errPolicy), errors.Is(err, errTooLong):
-			writeErr(w, http.StatusUnprocessableEntity, err.Error())
-		case errors.Is(err, ErrUserNotFound):
-			writeErr(w, http.StatusNotFound, "user not found")
-		default:
-			s.adminInternal(w, "set password", err)
-		}
 		return
 	}
 	// No password: hand the administrator a single-use reset link.
@@ -756,4 +877,60 @@ func (s *Service) adminMagicLink(w http.ResponseWriter, r *http.Request) {
 	s.auditCross(ctx, actorOf(r), u, "magic-link")
 	s.fire(ctx, EventMagicLinkIssued, map[string]string{"actor_id": actorOf(r), "user_id": u.ID, "expires_at": expires})
 	writeJSON(w, http.StatusOK, map[string]any{"link": magicLink(token), "emailed": false, "expires_at": expires})
+}
+
+// adminSetPassword is the admin set-password mode: one transaction that locks
+// the target, judges it, and writes the hash only while the roles value it
+// judged is still the stored one. A zero-row write means the account changed
+// (promoted) after the judgement, so nothing is written and the refusal is
+// reported as a 409 and an auth.credential_refused event. The provenance of
+// the password is the acting administrator.
+func (s *Service) adminSetPassword(ctx context.Context, r *http.Request, id, password string) (*User, error) {
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	hash, err := hashPassword(password) // before the transaction: bcrypt must not hold the guard
+	if err != nil {
+		return nil, err
+	}
+	actorID := actorOf(r)
+	var target *User
+	refused := false
+	err = s.adminTx(ctx, func(tx *sql.Tx) error {
+		found, err := s.txLockUser(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return &httpError{status: http.StatusNotFound, msg: "user not found"}
+		}
+		u, err := s.txUser(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if u == nil {
+			return &httpError{status: http.StatusNotFound, msg: "user not found"}
+		}
+		if err := s.adminTargetErr(r, u); err != nil {
+			return err
+		}
+		ok, err := s.txSetPasswordIfRoles(ctx, tx, u.ID, hash, u.Roles)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			refused = true
+			return nil
+		}
+		target = u
+		return s.markProvenance(ctx, tx, u.ID, fieldPassword, actorID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if refused {
+		s.fire(ctx, EventCredentialRefused, map[string]string{"type": "set-password", "issuer": actorID, "target_id": id})
+		return nil, conflict("the account changed while the password was being set; retry")
+	}
+	return target, nil
 }

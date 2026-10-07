@@ -41,6 +41,19 @@ const (
 	EventAdminCrossControl = "auth.admin_cross_control"
 	// EventAdminResetLinkIssued: actor_id, user_id, expires_at (no link).
 	EventAdminResetLinkIssued = "auth.admin_reset_link_issued"
+	// EventAdminPromoted fires when an account becomes an administrator through
+	// the admin API: actor_id, target_id, tainted (comma-joined fields whose
+	// email/password another administrator set, empty if none), accepted
+	// ("true" when the promoter explicitly accepted that, else "false").
+	EventAdminPromoted = "auth.admin_promoted"
+	// EventAdminDemoted fires when an administrator loses the role through the
+	// admin API: actor_id, target_id.
+	EventAdminDemoted = "auth.admin_demoted"
+	// EventCredentialRefused fires when an admin-issued credential (a reset link
+	// redemption or an admin-set password) is refused because the account is, or
+	// became, an administrator or changed under the operation: type ("reset" or
+	// "set-password"), issuer (the administrator), target_id. Never the token.
+	EventCredentialRefused = "auth.credential_refused"
 )
 
 // fire dispatches an auth event on the kernel hook bus (no-op if unavailable).

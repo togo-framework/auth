@@ -73,7 +73,13 @@ func (s *Service) patIdentity(ctx context.Context, token string) (*Identity, err
 			return nil, ErrInvalidCredentials
 		}
 	}
-	return &Identity{ID: userID, Permissions: splitCSV(abilities), Guard: "pat"}, nil
+	id := &Identity{ID: userID, Permissions: splitCSV(abilities), Guard: "pat"}
+	// A PAT is never an administrator and carries only its own abilities, so
+	// only the owner's existence is revalidated.
+	if err := s.revalidate(ctx, id, true); err != nil {
+		return nil, err
+	}
+	return id, nil
 }
 
 func (s *Service) handleCreateToken(w http.ResponseWriter, r *http.Request) {
