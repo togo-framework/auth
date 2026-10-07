@@ -53,7 +53,7 @@ const (
 	// redemption or an admin-set password) is refused because the account is, or
 	// became, an administrator or changed under the operation: type ("reset" or
 	// "set-password"), issuer (the administrator), target_id. Never the token.
-	EventCredentialRefused = "auth.credential_refused"
+	EventCredentialRefused = "auth.credential_refused" //#nosec G101 -- an event name, not a credential
 )
 
 // fire dispatches an auth event on the kernel hook bus (no-op if unavailable).
