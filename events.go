@@ -23,9 +23,9 @@ const (
 	// Admin user-management events. Every payload is a map[string]string that
 	// names the acting administrator (actor_id) and never carries a secret: no
 	// token, link or password.
-	EventUserCreated = "auth.user_created" // actor_id, user_id, email
-	EventUserUpdated = "auth.user_updated" // actor_id, user_id, fields
-	EventUserDeleted = "auth.user_deleted" // actor_id, user_id, email
+	EventUserCreated = "auth.user_created" // actor_id, target_id, user_id, email
+	EventUserUpdated = "auth.user_updated" // actor_id, target_id, user_id, fields (names only)
+	EventUserDeleted = "auth.user_deleted" // actor_id, target_id, user_id, email
 	// EventUserImpersonated: actor_id, target_id, at, expires_at.
 	EventUserImpersonated = "auth.user_impersonated"
 	// EventImpersonationEnded: actor_id, target_id, at.

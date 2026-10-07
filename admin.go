@@ -546,6 +546,13 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 			fields = append(fields, col)
 		}
 		if body.Email != nil && email != u.Email {
+			// Changing another administrator's email hands over the account via
+			// the public password-reset flow, so it follows the same rule as
+			// reset-password and magic-link. Roles, permissions and delete of
+			// other administrators stay allowed (and audited).
+			if err := s.adminTargetErr(r, u); err != nil {
+				return err
+			}
 			if taken, err := s.emailTaken(ctx, tx, email, u.ID); err != nil {
 				return err
 			} else if taken {
@@ -581,7 +588,7 @@ func (s *Service) adminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(fields) > 0 {
-		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "user_id": updated.ID, "fields": strings.Join(fields, ",")})
+		s.fire(ctx, EventUserUpdated, map[string]string{"actor_id": actorOf(r), "target_id": updated.ID, "user_id": updated.ID, "fields": strings.Join(fields, ",")})
 	}
 	writeJSON(w, http.StatusOK, toAdminUser(updated))
 }
@@ -625,7 +632,7 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		s.failAdmin(w, "delete user", err)
 		return
 	}
-	s.fire(ctx, EventUserDeleted, map[string]string{"actor_id": actorOf(r), "user_id": gone.ID, "email": gone.Email})
+	s.fire(ctx, EventUserDeleted, map[string]string{"actor_id": actorOf(r), "target_id": gone.ID, "user_id": gone.ID, "email": gone.Email})
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": gone.ID})
 }
 
@@ -634,13 +641,21 @@ func (s *Service) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 // Impersonating, setting the password of, or minting a sign-in link for another
 // administrator are all ways of becoming them, so one rule covers all three.
 func (s *Service) refuseAdminTarget(w http.ResponseWriter, r *http.Request, target *User) bool {
+	if err := s.adminTargetErr(r, target); err != nil {
+		s.failAdmin(w, "admin target", err)
+		return true
+	}
+	return false
+}
+
+// adminTargetErr is refuseAdminTarget as an error, for use inside a transaction.
+func (s *Service) adminTargetErr(r *http.Request, target *User) error {
 	actor, _ := IdentityFrom(r.Context())
 	if actor == nil || target.ID == actor.ID || !isAdminUser(target) || impersonateAdminsAllowed() {
-		return false
+		return nil
 	}
 	s.deny(r, actor)
-	writeErr(w, http.StatusForbidden, "administrators cannot be acted on this way")
-	return true
+	return &httpError{http.StatusForbidden, "administrators cannot be acted on this way"}
 }
 
 func (s *Service) adminResetPassword(w http.ResponseWriter, r *http.Request) {

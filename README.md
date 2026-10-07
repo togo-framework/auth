@@ -60,6 +60,26 @@ Events: `auth.user_created|updated|deleted|impersonated`, `auth.impersonation_en
 `auth.magic_link_issued`, `auth.admin_reset_link_issued`. Payloads name the actor and
 never carry a token or link. See `SECURITY.md` for the policy.
 
+Rules for acting on another administrator: impersonate, `reset-password`, `magic-link`
+and changing their `email` (PATCH) are refused with 403 unless `AUTH_IMPERSONATE_ADMINS=true`;
+self-edits are always allowed. Changing roles or permissions of, or deleting, another admin
+is allowed (the last administrator is always protected) and audited: `auth.user_updated`
+carries `actor_id`, `target_id` and the changed field names (no values); `auth.user_deleted`
+carries `actor_id` and `target_id`. A magic link redeemed for a user starts a session that
+names the issuing admin (`impersonator`, `act` claim, `auth.login` event, plus
+`auth.magic_link_redeemed`) and lasts as long as an impersonation.
+
+Config: `AUTH_PUBLIC_URL`/`APP_URL` (link base), `AUTH_RESET_PATH` (default `/reset-password`),
+`AUTH_POST_LOGIN_URL`, `AUTH_IMPERSONATION_TTL_MINUTES` (default 30, max 480),
+`AUTH_IMPERSONATE_ADMINS` (default off).
+
+Token verification: `Verify(token)` now delegates to `VerifyContext(ctx, token)`, which also
+enforces revocation and the actor/target checks for impersonation tokens (a database lookup).
+Prefer `VerifyContext` with the request context.
+
+`auth.password_reset_requested` carries the raw reset token so a mailer can deliver it; it is
+for in-process hook subscribers only and must never be logged or forwarded to an external bus.
+
 ## Frontend
 
 UI lives in the separate [dashboard](https://github.com/togo-framework/dashboard)

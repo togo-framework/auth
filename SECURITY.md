@@ -38,7 +38,14 @@ enterprise baseline and scanned on every push (`govulncheck` + `gosec`).
   (`AUTH_IMPERSONATION_TTL_MINUTES`, max 480), audit events name actor and target,
   revocable via `POST /api/auth/impersonation/stop`, dies if the admin is demoted,
   cannot call the admin API or change the borrowed account's password/2FA/PIN/tokens.
-  Impersonating another admin is refused unless `AUTH_IMPERSONATE_ADMINS=true`.
+  Impersonating another admin is refused unless `AUTH_IMPERSONATE_ADMINS=true`; the same
+  rule covers reset-password, magic-link and changing another admin's email (account
+  takeover by other means). Role/permission changes and deletes of admins are allowed,
+  keep the last-admin invariant (enforced in a database transaction, safe across
+  instances) and are audited with actor and target. A redeemed magic link names its
+  issuing admin in the session. `Verify` delegates to `VerifyContext`, so revocation is
+  enforced for every caller. `auth.password_reset_requested` carries the raw token for
+  the mailer: in-process hook subscribers only; never log or forward it.
 
 ## Configuration
 `AUTH_SECRET`, `AUTH_DRIVER` (base|supabase), `AUTH_TTL_HOURS`, `AUTH_MIN_PASSWORD`,

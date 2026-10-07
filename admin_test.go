@@ -789,3 +789,41 @@ func TestImpersonationDiesWhenTheActorIsNoLongerAdmin(t *testing.T) {
 		t.Fatalf("an impersonation outliving its admin must be refused: %d", code)
 	}
 }
+
+// Admins manage admins: role changes and deletes of another administrator are
+// allowed, but audited with actor and target (field names only, no values).
+func TestAdminManagingAdminsIsAudited(t *testing.T) {
+	w := newAdminWorld(t)
+	two, err := w.svc.CreateUser(context.Background(), "two@example.com", pw, []string{"admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := w.capture(EventUserUpdated)
+	deleted := w.capture(EventUserDeleted)
+	base := "/api/auth/admin/users/" + two.ID
+	if code, _, _ := raw(t, w.srv, http.MethodPatch, base, w.adminTok, map[string]any{"roles": []string{"editor"}, "permissions": []string{"x"}}); code != http.StatusOK {
+		t.Fatalf("role change of another admin: %d", code)
+	}
+	if len(*updated) != 1 {
+		t.Fatalf("updated events: %d", len(*updated))
+	}
+	u := (*updated)[0].(map[string]string)
+	if u["actor_id"] != w.adminID || u["target_id"] != two.ID || u["fields"] != "roles,permissions" {
+		t.Fatalf("update event: %v", u)
+	}
+	// Demoted, the account is an ordinary user again; delete another admin.
+	three, err := w.svc.CreateUser(context.Background(), "three@example.com", pw, []string{"admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := raw(t, w.srv, http.MethodDelete, "/api/auth/admin/users/"+three.ID, w.adminTok, nil); code != http.StatusOK {
+		t.Fatalf("delete of another admin: %d", code)
+	}
+	if len(*deleted) != 1 {
+		t.Fatalf("deleted events: %d", len(*deleted))
+	}
+	d := (*deleted)[0].(map[string]string)
+	if d["actor_id"] != w.adminID || d["target_id"] != three.ID {
+		t.Fatalf("delete event: %v", d)
+	}
+}
