@@ -11,10 +11,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -106,6 +108,13 @@ type Identity struct {
 	Roles       []string `json:"roles"`
 	Permissions []string `json:"permissions"`
 	Guard       string   `json:"guard"`
+	// Impersonator is the id of the administrator acting as this identity. It is
+	// empty for every real login, and set only on tokens issued through
+	// POST /api/auth/admin/users/{id}/impersonate (the token's `act.sub` claim).
+	Impersonator string `json:"impersonator,omitempty"`
+	// TokenID is the token's jti. It is set only on impersonation tokens, which
+	// are revocable.
+	TokenID string `json:"-"`
 }
 
 // Can reports whether the identity has a permission.
@@ -136,6 +145,7 @@ type Service struct {
 	def           string
 	sessions      SessionStore // nil => stateless cookie sessions
 	sessionDriver string
+	adminMu       sync.Mutex // serialises admin mutations that guard the last-admin invariant
 }
 
 // New builds the service, ensures the users table exists, and registers the
@@ -177,6 +187,10 @@ func New(k *togo.Kernel) (*Service, error) {
 	if err := s.ensureResetSchema(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := s.ensureAdminSchema(context.Background()); err != nil {
+		return nil, err
+	}
+	warnLegacyFlags(k.Log)
 	s.RegisterGuard("api", &dbAuthenticator{s: s})
 	return s, nil
 }
@@ -226,6 +240,13 @@ func (s *Service) ensureSchema(ctx context.Context) error {
 
 // IssueToken signs a JWT for an identity.
 func (s *Service) IssueToken(id Identity) (string, error) {
+	return s.signToken(id, s.ttl)
+}
+
+// signToken signs a JWT for id valid for ttl. An identity with an Impersonator
+// gets an `act` claim (RFC 8693) naming the acting administrator and a jti, so
+// the token is distinguishable from a login and can be revoked.
+func (s *Service) signToken(id Identity, ttl time.Duration) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"sub":   id.ID,
@@ -236,14 +257,91 @@ func (s *Service) IssueToken(id Identity) (string, error) {
 		"iss":   "togo",
 		"iat":   now.Unix(),
 		"nbf":   now.Unix(),
-		"exp":   now.Add(s.ttl).Unix(),
+		"exp":   now.Add(ttl).Unix(),
+	}
+	if id.Impersonator != "" {
+		claims["act"] = map[string]string{"sub": id.Impersonator}
+		claims["jti"] = genID()
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
+}
+
+// warnLegacyFlags logs a startup warning for an environment variable that an
+// earlier draft documented and that now does nothing, so an operator who set it
+// does not believe it is in force.
+func warnLegacyFlags(log *slog.Logger) {
+	if os.Getenv("AUTH_IMPERSONATE_ADMINS") != "" {
+		log.Warn("AUTH_IMPERSONATE_ADMINS is set but has no effect; the flag is AUTH_ADMIN_CROSS_CONTROL")
+	}
+}
+
+// errAccountGone is returned when a token names an account that no longer
+// exists. Request auth maps it to 401.
+var errAccountGone = errors.New("account no longer exists")
+
+// VerifyContext parses and validates a token, then revalidates it against the
+// database. It is the one authoritative verification path; Verify delegates
+// to it.
+//
+// Strict session revalidation (base driver): the token proves who the caller
+// is and that it was issued by this service; the database decides what the
+// caller may do now. The account is loaded by id on every call, a missing
+// account is refused, and the identity's email, roles and permissions are
+// replaced by the stored values. Every consumer of the identity (RequireRole,
+// RequirePermission, IdentityFrom, requireAdmin, apps using Authenticate) is
+// therefore database-authoritative without any change on their side. An
+// impersonation or magic-link session additionally needs its jti unrevoked and
+// its administrator still an administrator.
+func (s *Service) VerifyContext(ctx context.Context, token string) (*Identity, error) {
+	id, err := s.verify(token)
+	if err != nil {
+		return nil, err
+	}
+	if id.Impersonator != "" {
+		if err := s.checkImpersonation(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.revalidate(ctx, id, false); err != nil {
+		return nil, err
+	}
+	return id, nil
+}
+
+// revalidate is the single place where "is this account still allowed to hold
+// a session" is decided. Today the account existing is the whole test (there
+// is no disabled state); a future disabled flag or security-version check
+// belongs here and nowhere else. keepGrants is for personal access tokens,
+// whose abilities are their own scope and never come from the account.
+// It applies to the base driver only: with an external driver (supabase) the
+// provider owns identity and the users table is not authoritative.
+func (s *Service) revalidate(ctx context.Context, id *Identity, keepGrants bool) error {
+	if s.driver() != "base" {
+		return nil
+	}
+	u, err := s.userByID(ctx, id.ID)
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return errAccountGone
+	}
+	if keepGrants {
+		return nil
+	}
+	id.Email = u.Email
+	id.Roles = splitCSV(u.Roles)
+	id.Permissions = splitCSV(u.Permissions)
+	return nil
 }
 
 // Verify parses a token into an Identity. Enforces HS256, a required expiry, and
 // the issuer — rejecting alg-confusion, unexpiring, and foreign tokens.
 func (s *Service) Verify(token string) (*Identity, error) {
+	return s.VerifyContext(context.Background(), token)
+}
+
+func (s *Service) verify(token string) (*Identity, error) {
 	if token == "" {
 		return nil, errors.New("missing token")
 	}
@@ -255,13 +353,18 @@ func (s *Service) Verify(token string) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Identity{
+	id := &Identity{
 		ID:          str(claims["sub"]),
 		Email:       str(claims["email"]),
 		Roles:       splitCSV(str(claims["roles"])),
 		Permissions: splitCSV(str(claims["perms"])),
 		Guard:       str(claims["guard"]),
-	}, nil
+	}
+	if act, ok := claims["act"].(map[string]any); ok {
+		id.Impersonator = str(act["sub"])
+		id.TokenID = str(claims["jti"])
+	}
+	return id, nil
 }
 
 // hash + compare helpers.

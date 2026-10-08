@@ -44,15 +44,25 @@ func (s *Service) SetRoles(ctx context.Context, userID string, roles []string) e
 	if err != nil {
 		return err
 	}
+	// The role write and the privilege epoch bump (which voids outstanding
+	// recovery tokens, see admin_recovery.go) commit together.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	//#nosec G202,G701 -- dialect placeholders only; values parameterized
-	res, err := db.ExecContext(ctx, `UPDATE users SET roles = `+s.ph(1)+` WHERE id = `+s.ph(2), strings.Join(clean, ","), userID)
+	res, err := tx.ExecContext(ctx, `UPDATE users SET roles = `+s.ph(1)+` WHERE id = `+s.ph(2), strings.Join(clean, ","), userID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrUserNotFound
 	}
-	return nil
+	if err := s.bumpPrivEpoch(ctx, tx, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateUser adds an account with a password and roles, for seeders and
@@ -84,6 +94,12 @@ func (s *Service) CreateUser(ctx context.Context, email, password string, roles 
 // who cannot receive a reset link. The password policy applies, and
 // EventPasswordChanged fires as it does for a self-service change.
 func (s *Service) SetPassword(ctx context.Context, userID, password string) error {
+	return s.setPasswordBy(ctx, userID, password, "")
+}
+
+// setPasswordBy is SetPassword with the acting administrator recorded in the
+// event (actorID may be empty).
+func (s *Service) setPasswordBy(ctx context.Context, userID, password, actorID string) error {
 	if err := validatePassword(password); err != nil {
 		return err
 	}
@@ -103,6 +119,10 @@ func (s *Service) SetPassword(ctx context.Context, userID, password string) erro
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrUserNotFound
 	}
-	s.fire(ctx, EventPasswordChanged, map[string]string{"user_id": userID, "by": "admin"})
+	payload := map[string]string{"user_id": userID, "by": "admin"}
+	if actorID != "" {
+		payload["actor_id"] = actorID
+	}
+	s.fire(ctx, EventPasswordChanged, payload)
 	return nil
 }

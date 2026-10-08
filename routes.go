@@ -38,28 +38,31 @@ func (s *Service) mountRoutes() {
 	r.Get("/api/auth/csrf", s.issueCSRF)
 	r.Get("/api/auth/methods", s.handleMethods)
 	r.With(s.Middleware).Get("/api/auth/me", s.handleMe)
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/change-password", s.handleChangePassword)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/change-password", s.handleChangePassword)
 	r.With(s.Middleware).Post("/api/auth/logout", s.handleLogout)
 
 	// MFA: OTP (delivery decoupled via EventOTPRequested), TOTP 2FA, PIN lock screen.
 	r.With(s.csrfGuard).Post("/api/auth/otp", rl.limit(s.handleOTP))
 	r.With(s.csrfGuard).Post("/api/auth/otp/verify", rl.limit(s.handleOTPVerify))
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/enroll", s.handle2FAEnroll)
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/verify", s.handle2FAVerify)
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/2fa/disable", s.handle2FADisable)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/2fa/enroll", s.handle2FAEnroll)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/2fa/verify", s.handle2FAVerify)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/2fa/disable", s.handle2FADisable)
 	// Second step of a 2FA login: challenge (from /login) + code → session.
 	r.With(s.csrfGuard).Post("/api/auth/2fa/challenge", rl.limit(s.handle2FAChallenge))
 
 	// Password reset; delivery is decoupled via EventPasswordResetRequested.
 	r.With(s.csrfGuard).Post("/api/auth/password/forgot", rl.limit(s.handlePasswordForgot))
 	r.With(s.csrfGuard).Post("/api/auth/password/reset", rl.limit(s.handlePasswordReset))
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin", s.handlePINSet)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/pin", s.handlePINSet)
 	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/pin/verify", s.handlePINVerify)
 
 	// Scoped API tokens (Sanctum/Cloudflare-style abilities).
-	r.With(s.Middleware, s.csrfGuard).Post("/api/auth/tokens", s.handleCreateToken)
+	r.With(s.Middleware, s.noImpersonation, s.csrfGuard).Post("/api/auth/tokens", s.handleCreateToken)
 	r.With(s.Middleware).Get("/api/auth/tokens", s.handleListTokens)
 	r.With(s.Middleware, s.csrfGuard).Delete("/api/auth/tokens/{id}", s.handleRevokeToken)
+
+	// Admin user management, magic-link sign-in and ending an impersonation.
+	s.mountAdminRoutes(rl)
 }
 
 // minPasswordLen is the enforced minimum (override via AUTH_MIN_PASSWORD).

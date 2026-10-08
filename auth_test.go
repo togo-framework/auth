@@ -18,7 +18,7 @@ func TestTokenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := s.Verify(tok)
+	out, err := s.verify(tok)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestTokenRoundTrip(t *testing.T) {
 
 func TestVerifyRejectsForgedSecret(t *testing.T) {
 	tok, _ := testService("secret-number-one-aaaaaaaaaaaaaaaaaaaa").IssueToken(Identity{ID: "u1"})
-	if _, err := testService("secret-number-two-bbbbbbbbbbbbbbbbbbbb").Verify(tok); err == nil {
+	if _, err := testService("secret-number-two-bbbbbbbbbbbbbbbbbbbb").verify(tok); err == nil {
 		t.Fatal("token signed with a different secret must be rejected")
 	}
 }
@@ -38,7 +38,7 @@ func TestVerifyRejectsExpired(t *testing.T) {
 	s := testService("a-sufficiently-long-test-secret-string!!")
 	claims := jwt.MapClaims{"sub": "u1", "iss": "togo", "exp": time.Now().Add(-time.Hour).Unix()}
 	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
-	if _, err := s.Verify(tok); err == nil {
+	if _, err := s.verify(tok); err == nil {
 		t.Fatal("expired token must be rejected")
 	}
 }
@@ -46,7 +46,7 @@ func TestVerifyRejectsExpired(t *testing.T) {
 func TestVerifyRejectsNoExpiry(t *testing.T) {
 	s := testService("a-sufficiently-long-test-secret-string!!")
 	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "u1", "iss": "togo"}).SignedString(s.secret)
-	if _, err := s.Verify(tok); err == nil {
+	if _, err := s.verify(tok); err == nil {
 		t.Fatal("token without exp must be rejected (WithExpirationRequired)")
 	}
 }
@@ -56,7 +56,7 @@ func TestVerifyRejectsAlgNone(t *testing.T) {
 	tok, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
 		"sub": "u1", "iss": "togo", "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString(jwt.UnsafeAllowNoneSignatureType)
-	if _, err := s.Verify(tok); err == nil {
+	if _, err := s.verify(tok); err == nil {
 		t.Fatal("alg=none token must be rejected")
 	}
 }

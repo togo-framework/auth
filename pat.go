@@ -29,7 +29,9 @@ func (s *Service) authenticate(r *http.Request) (*Identity, error) {
 			return s.patIdentity(r.Context(), raw)
 		}
 	}
-	return s.Verify(s.resolveToken(r))
+	// An impersonation token is only as good as the administrator behind it, so
+	// the database-backed verification is the one request auth uses.
+	return s.VerifyContext(r.Context(), s.resolveToken(r))
 }
 
 func (s *Service) ensurePATSchema(ctx context.Context) error {
@@ -71,7 +73,13 @@ func (s *Service) patIdentity(ctx context.Context, token string) (*Identity, err
 			return nil, ErrInvalidCredentials
 		}
 	}
-	return &Identity{ID: userID, Permissions: splitCSV(abilities), Guard: "pat"}, nil
+	id := &Identity{ID: userID, Permissions: splitCSV(abilities), Guard: "pat"}
+	// A PAT is never an administrator and carries only its own abilities, so
+	// only the owner's existence is revalidated.
+	if err := s.revalidate(ctx, id, true); err != nil {
+		return nil, err
+	}
+	return id, nil
 }
 
 func (s *Service) handleCreateToken(w http.ResponseWriter, r *http.Request) {
